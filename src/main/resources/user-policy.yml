@@ -1,0 +1,52 @@
+user-policy:
+  auth:
+    # Allowed values:
+    # - ONLY_EMAIL       (Only email/password or Google allowed)
+    # - ONLY_PHONE       (Only mobile number + OTP allowed)
+    # - EITHER           (User can register/login with either email OR phone)
+    # - BOTH             (User must provide and verify BOTH email AND phone)
+    mode: EITHER
+
+    # Toggle third-party Google OAuth
+    allow-google: true
+
+    # OTP verification requirements
+    require-email-otp: true
+    require-phone-otp: true
+
+  bio:
+    enabled: true
+    max-characters: 160
+
+  name:
+    max-length: 50
+    # Default: Alphanumeric and spaces only
+    regex: "^[a-zA-Z0-9 ]+$"
+
+  picture:
+    enabled: true              # Feature toggle: if false, picture endpoints/uploads are rejected
+    mandatory: false            # If true, user cannot complete profile without uploading
+    max-size-mb: 5              # File upload payload limit
+    allow-private-toggle: true  # Allows user to hide their photo from public profile
+
+  followers:
+    enabled: true
+
+  privacy:
+    enabled: true  # Feature toggle: allows users to set their entire profile to private
+
+  email:
+    mandatory: true              # If true, user cannot register or complete profile without email
+    allow-visibility-toggle: true # Allows user to mark email as private/hidden on public profiles
+
+  phone:
+    mandatory: false             # If true, mobile number is strictly required
+    allow-visibility-toggle: true # Allows user to mark phone as private/hidden on public profiles
+
+  public-profiles:
+    enabled: true                 # Feature toggle for social links
+    allow-visibility-toggle: true # Allows hiding all social links from public view
+
+  user-disable:
+    enabled: true                  # Feature toggle: allows user accounts to be deactivated/disabled
+    allow-self-reactivation: true  # If true, user can log back in within grace period to re-enable
