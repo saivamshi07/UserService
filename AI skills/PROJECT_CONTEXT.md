@@ -3,17 +3,17 @@
 ## 1. Tech Stack
 - Framework: Spring Boot 3.x / 4.x, Java 21
 - Database: PostgreSQL 17 (Relational core + JSONB attributes + `pg_trgm` GIN indexes for fuzzy search)
-- Caching & Sessions: Redis
+- Caching & Sessions: Redis 7 (`spring-boot-starter-data-redis` + `StringRedisTemplate`)
 - Messaging: Apache Kafka (Transactional Outbox pattern planned)
-- Object Storage: S3 / MinIO (Presigned URLs for profile pictures)
+- Object Storage: S3 / MinIO via AWS SDK v2 (`software.amazon.awssdk:s3:2.29.50`)
 - Google Auth: Google API Client library (`com.google.api-client:google-api-client:2.7.0`)
-- Security: Spring Security Crypto (`BCryptPasswordEncoder`)
+- Security: Spring Security Crypto (`BCryptPasswordEncoder`) + JJWT 0.12.6 + `JwtAuthenticationFilter`
 
 ## 2. Configuration & Policy-Driven Architecture
 - Dynamic policy management using `src/main/resources/user-policy.yml`
 - Injected via `spring.config.import=classpath:user-policy.yml` in `application.properties`
 - Properties mapped to `@ConfigurationProperties(prefix = "user-policy") UserPolicyConfig`
-- Config toggles: Auth modes (EITHER, BOTH, ONLY_EMAIL, ONLY_PHONE), name validation regex/length, bio limits, profile picture restrictions, privacy toggles, deactivation rules, Google OAuth toggle (`allow-google: true`).
+- Config toggles: Auth modes (EITHER, BOTH, ONLY_EMAIL, ONLY_PHONE), name validation regex/length, bio limits, profile picture restrictions (5MB, JPEG/PNG/WEBP), privacy toggles, deactivation rules, Google OAuth toggle (`allow-google: true`).
 
 ## 3. Database Schema & Entities
 1. `users` Table:
@@ -50,25 +50,43 @@
   - Typo-tolerant trigram similarity ranking (`similarity > 0.2` on username, `> 0.15` on bio)
   - Substring matching via `ILIKE`
 
-## 5. Auth & Security Design
-- JWT stateless access tokens (15-min TTL) delivered via `HttpOnly`, `Secure`, `SameSite=Strict` cookies.
-- Long-lived refresh tokens (7-day TTL) stored in Redis (`refresh_token:<token> -> userId`).
+## 5. Auth, Redis & Security Design
+- **Anti-Spoofing & Context Security**:
+  - `JwtAuthenticationFilter`: Extracts and cryptographically validates JWT tokens from `access_token` cookie or `Authorization: Bearer <token>`.
+  - Raw unverified `X-User-Id` headers are rejected/ignored unless accompanied by a verified `X-Gateway-Secret`.
+  - `UserContext`: ThreadLocal storing authenticated user ID, securely accessed via `UserContext.getRequiredUserId()` and automatically cleared after request completion.
+- **Session Tokens & Redis Storage**:
+  - Stateless Access Tokens (15-min TTL) delivered via `HttpOnly`, `Secure`, `SameSite=Strict` cookies.
+  - Refresh Tokens (7-day TTL) delivered via `HttpOnly`, `Secure`, `SameSite=Strict` cookies restricted to `/api/v1/auth`.
+  - `RedisSessionService`:
+    - Stores `refresh_token:<jti> -> userId` with 7-day TTL.
+    - Tracks active user sessions in `user_sessions:<userId>` sets.
+    - Token Rotation: Rotates refresh token on each `/refresh` call (old jti deleted, new jti persisted).
+    - Immediate Revocation: On `/logout`, deletes `refresh_token:<jti>` from Redis.
+    - Complete Account Revocation: On `deactivateUser()`, purges all active session keys across all user devices.
 - Passwords hashed using `BCryptPasswordEncoder`.
 - Google OAuth: Verifies Google ID tokens via `POST /api/v1/auth/google`, auto-provisions or links existing accounts.
-- API Gateway acts as the perimeter barrier: extracts cookie, verifies signature statelessly, injects downstream headers (`X-User-Id`, `X-User-Roles`), and strips incoming `X-User-*` headers from external clients.
 
-## 6. Current Progress
+## 6. S3 / MinIO Profile Picture Presigned URLs
+- Direct-to-storage architecture offloads heavy binary transfers from the Spring Boot application.
+- `S3Config` + `S3Presigner` generates AWS SigV4 signed PUT URLs for any S3-compatible store (AWS S3, MinIO, Cloudflare R2).
+- `POST /api/v1/users/me/avatar/presigned-url`:
+  - Enforces `user-policy.yml` maximum size limits (5 MB).
+  - Enforces allowed MIME types (`image/jpeg`, `image/png`, `image/webp`).
+  - Generates partitioned S3 key `avatars/{userId}/{randomUUID}.{ext}`.
+  - Returns presigned `uploadUrl`, public `fileUrl`, and `expiresAt` (15 minutes).
+
+## 7. Current Progress
 - Configured: `user-policy.yml`, `application.properties`, and `UserPolicyConfig`
 - Entities defined: `User`, `UserFollow`, `UserFollowId`, `UserAuditLog`
-- Repositories implemented: `UserRepository` (with `pg_trgm` search), `UserFollowRepository`, `UserAuditLogRepository`
+- Repositories implemented: `UserRepository` (with `findExistingIdentifiers` and `pg_trgm` search), `UserFollowRepository`, `UserAuditLogRepository`
 - DatabaseInitializer: Guarantees `pg_trgm` and GIN indexes exist on startup
-- DTOs & Custom Exceptions: `RegisterRequest`, `LoginRequest`, `GoogleAuthRequest`, `UserResponse`, `UpdateUserRequest`, `UserSearchResponse`, `UserFollowResponse`, `GlobalExceptionHandler`
-- Business Services: `PolicyValidatorService`, `GoogleAuthService`, `UserService`, `UserFollowService`
+- DTOs & Custom Exceptions: `RegisterRequest`, `LoginRequest`, `GoogleAuthRequest`, `UserResponse`, `UpdateUserRequest`, `UserSearchResponse`, `UserFollowResponse`, `AvatarPresignedUrlRequest`, `AvatarPresignedUrlResponse`, `GlobalExceptionHandler`
+- Business Services: `PolicyValidatorService`, `GoogleAuthService`, `UserService`, `UserFollowService`, `JwtTokenService`, `RedisSessionService`, `AvatarStorageService`
+- Security Filter & Context: `JwtAuthenticationFilter`, `UserContext`
 - REST Controllers: `AuthController`, `UserController`, `UserFollowController`
-- Automated Tests: Passing end-to-end integration tests verifying registration, auditing, and pg_trgm search.
+- Automated Tests: 15 tests passing verifying registration, auditing, pg_trgm search, complete auth cookie lifecycles, Redis token rotation & instant revocation, spoofing prevention, and S3 presigned URL generation.
 
-## 7. Next Tasks
-1. JWT Issuance & Cookie Management (Session tokens delivered via Secure HttpOnly cookies).
-2. Redis Integration (Refresh token storage with 7-day TTL).
-3. Apache Kafka Event Publishing (e.g. `USER_REGISTERED`, `USER_DEACTIVATED`).
-4. MinIO / S3 Profile Picture Presigned Upload URL generation.
+## 8. Next Tasks
+1. Apache Kafka Event Publishing (Transactional Outbox pattern for domain events: `USER_REGISTERED`, `USER_DEACTIVATED`).
+2. Complete `docker-compose.yml` orchestrating PostgreSQL, Redis, MinIO, and Kafka (KRaft).

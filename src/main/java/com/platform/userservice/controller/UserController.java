@@ -1,10 +1,15 @@
 package com.platform.userservice.controller;
 
+import com.platform.userservice.context.UserContext;
+import com.platform.userservice.dto.AvatarPresignedUrlRequest;
+import com.platform.userservice.dto.AvatarPresignedUrlResponse;
 import com.platform.userservice.dto.UpdateUserRequest;
 import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.dto.UserSearchResponse;
+import com.platform.userservice.service.AvatarStorageService;
 import com.platform.userservice.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -13,9 +18,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -28,32 +33,36 @@ import java.util.UUID;
 public class UserController {
 
     private final UserService userService;
+    private final AvatarStorageService avatarStorageService;
 
     @GetMapping("/{id}")
-    public ResponseEntity<UserResponse> getUserById(
-            @PathVariable("id") UUID id,
-            @RequestHeader(value = "X-User-Id", required = false) UUID currentUserId) {
+    public ResponseEntity<UserResponse> getUserById(@PathVariable("id") UUID id) {
+        UUID currentUserId = UserContext.getUserId();
         return ResponseEntity.ok(userService.getUserById(id, currentUserId));
     }
 
     @GetMapping("/by-username/{username}")
-    public ResponseEntity<UserResponse> getUserByUsername(
-            @PathVariable("username") String username,
-            @RequestHeader(value = "X-User-Id", required = false) UUID currentUserId) {
+    public ResponseEntity<UserResponse> getUserByUsername(@PathVariable("username") String username) {
+        UUID currentUserId = UserContext.getUserId();
         return ResponseEntity.ok(userService.getUserByUsername(username, currentUserId));
     }
 
     @PutMapping("/me")
-    public ResponseEntity<UserResponse> updateProfile(
-            @RequestHeader("X-User-Id") UUID currentUserId,
-            @RequestBody UpdateUserRequest request) {
+    public ResponseEntity<UserResponse> updateProfile(@Valid @RequestBody UpdateUserRequest request) {
+        UUID currentUserId = UserContext.getRequiredUserId();
         return ResponseEntity.ok(userService.updateUserProfile(currentUserId, request));
     }
 
+    @PostMapping("/me/avatar/presigned-url")
+    public ResponseEntity<AvatarPresignedUrlResponse> generateAvatarPresignedUrl(
+            @Valid @RequestBody AvatarPresignedUrlRequest request) {
+        UUID currentUserId = UserContext.getRequiredUserId();
+        return ResponseEntity.ok(avatarStorageService.createPresignedUploadUrl(currentUserId, request));
+    }
+
     @DeleteMapping("/me")
-    public ResponseEntity<Void> deactivateAccount(
-            @RequestHeader("X-User-Id") UUID currentUserId,
-            HttpServletRequest httpRequest) {
+    public ResponseEntity<Void> deactivateAccount(HttpServletRequest httpRequest) {
+        UUID currentUserId = UserContext.getRequiredUserId();
         String clientIp = httpRequest.getRemoteAddr();
         String userAgent = httpRequest.getHeader("User-Agent");
         userService.deactivateUser(currentUserId, clientIp, userAgent);

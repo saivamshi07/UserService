@@ -10,12 +10,20 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.util.Set;
 import java.util.regex.Pattern;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class PolicyValidatorService {
+
+    private static final Set<String> ALLOWED_IMAGE_TYPES = Set.of(
+            "image/jpeg",
+            "image/jpg",
+            "image/png",
+            "image/webp"
+    );
 
     private final UserPolicyConfig policy;
 
@@ -81,6 +89,10 @@ public class PolicyValidatorService {
     }
 
     public void validateUpdateProfile(UpdateUserRequest request) {
+        if (request.getUsername() != null) {
+            validateUsername(request.getUsername());
+        }
+
         if (request.getBio() != null) {
             if (!policy.getBio().isEnabled() && StringUtils.hasText(request.getBio())) {
                 throw new PolicyViolationException("Bio feature is disabled by system policy");
@@ -112,6 +124,21 @@ public class PolicyValidatorService {
 
         if (request.getPublicProfiles() != null && !policy.getPublicProfiles().isEnabled()) {
             throw new PolicyViolationException("Public profiles / social links are disabled by system policy");
+        }
+    }
+
+    public void validateAvatarUpload(String contentType, long fileSizeBytes) {
+        if (!policy.getPicture().isEnabled()) {
+            throw new PolicyViolationException("Profile picture upload feature is disabled by system policy");
+        }
+
+        if (contentType == null || !ALLOWED_IMAGE_TYPES.contains(contentType.toLowerCase())) {
+            throw new PolicyViolationException("Invalid image content type: " + contentType + ". Allowed types: JPEG, PNG, WEBP");
+        }
+
+        long maxSizeBytes = policy.getPicture().getMaxSizeMb() * 1024L * 1024L;
+        if (fileSizeBytes > maxSizeBytes) {
+            throw new PolicyViolationException("File size exceeds maximum allowed limit of " + policy.getPicture().getMaxSizeMb() + " MB");
         }
     }
 

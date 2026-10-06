@@ -24,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,25 +39,39 @@ public class UserService {
     private final UserAuditLogRepository auditLogRepository;
     private final PolicyValidatorService policyValidator;
     private final PasswordEncoder passwordEncoder;
+    private final RedisSessionService redisSessionService;
 
     @Transactional
     public UserResponse registerUser(RegisterRequest request, String clientIp, String userAgent) {
         policyValidator.validateRegistration(request);
 
-        if (userRepository.existsByUsername(request.getUsername())) {
-            throw new DuplicateResourceException("Username '" + request.getUsername() + "' is already taken");
-        }
-        if (StringUtils.hasText(request.getEmail()) && userRepository.existsByEmail(request.getEmail())) {
-            throw new DuplicateResourceException("Email '" + request.getEmail() + "' is already in use");
-        }
-        if (StringUtils.hasText(request.getPhone()) && userRepository.existsByPhone(request.getPhone())) {
-            throw new DuplicateResourceException("Phone '" + request.getPhone() + "' is already in use");
+        String email = StringUtils.hasText(request.getEmail()) ? request.getEmail() : null;
+        String phone = StringUtils.hasText(request.getPhone()) ? request.getPhone() : null;
+
+        // Single DB round-trip check for existing identifiers
+        List<Object[]> duplicates = userRepository.findExistingIdentifiers(request.getUsername(), email, phone);
+        if (!duplicates.isEmpty()) {
+            for (Object[] row : duplicates) {
+                String existingUsername = (String) row[0];
+                String existingEmail = (String) row[1];
+                String existingPhone = (String) row[2];
+
+                if (request.getUsername().equalsIgnoreCase(existingUsername)) {
+                    throw new DuplicateResourceException("Username '" + request.getUsername() + "' is already taken");
+                }
+                if (email != null && email.equalsIgnoreCase(existingEmail)) {
+                    throw new DuplicateResourceException("Email '" + request.getEmail() + "' is already in use");
+                }
+                if (phone != null && phone.equals(existingPhone)) {
+                    throw new DuplicateResourceException("Phone '" + request.getPhone() + "' is already in use");
+                }
+            }
         }
 
         User user = User.builder()
                 .username(request.getUsername())
-                .email(request.getEmail())
-                .phone(request.getPhone())
+                .email(email)
+                .phone(phone)
                 .passwordHash(passwordEncoder.encode(request.getPassword()))
                 .isActive(true)
                 .build();
@@ -136,6 +151,13 @@ public class UserService {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + userId));
 
+        if (request.getUsername() != null && !request.getUsername().equals(user.getUsername())) {
+            if (userRepository.existsByUsername(request.getUsername())) {
+                throw new DuplicateResourceException("Username '" + request.getUsername() + "' is already taken");
+            }
+            user.setUsername(request.getUsername());
+        }
+
         if (request.getBio() != null) {
             user.setBio(request.getBio());
         }
@@ -172,6 +194,9 @@ public class UserService {
         user.setActive(false);
         user.setDisabledAt(Instant.now());
         userRepository.save(user);
+
+        // Instantly revoke all active sessions across all devices in Redis
+        redisSessionService.revokeAllUserSessions(userId);
 
         UserAuditLog auditLog = UserAuditLog.builder()
                 .userId(userId)

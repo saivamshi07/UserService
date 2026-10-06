@@ -1,8 +1,10 @@
 package com.platform.userservice;
 
 import com.platform.userservice.dto.RegisterRequest;
+import com.platform.userservice.dto.UpdateUserRequest;
 import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.dto.UserSearchResponse;
+import com.platform.userservice.exception.DuplicateResourceException;
 import com.platform.userservice.service.UserService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,5 +41,41 @@ class UserSearchIntegrationTest {
         Page<UserSearchResponse> searchResult = userService.searchUsers(username.substring(0, 5), PageRequest.of(0, 10));
         assertFalse(searchResult.isEmpty());
         assertTrue(searchResult.getContent().stream().anyMatch(u -> u.getUsername().equals(username)));
+    }
+
+    @Test
+    void testUpdateUsernameAndCollision() {
+        String uniqueSuffix = String.valueOf(System.currentTimeMillis());
+        String userA = "usera" + uniqueSuffix.substring(uniqueSuffix.length() - 4);
+        String userB = "userb" + uniqueSuffix.substring(uniqueSuffix.length() - 4);
+
+        UserResponse uA = userService.registerUser(RegisterRequest.builder()
+                .username(userA)
+                .email(userA + "@test.com")
+                .password("Password123!")
+                .build(), "127.0.0.1", "JUnit");
+
+        userService.registerUser(RegisterRequest.builder()
+                .username(userB)
+                .email(userB + "@test.com")
+                .password("Password123!")
+                .build(), "127.0.0.1", "JUnit");
+
+        // Attempt to rename userA to userB -> should throw DuplicateResourceException
+        assertThrows(DuplicateResourceException.class, () -> {
+            userService.updateUserProfile(uA.getId(), UpdateUserRequest.builder()
+                    .username(userB)
+                    .build());
+        });
+
+        // Valid username update
+        String newUsername = userA + "new";
+        UserResponse updated = userService.updateUserProfile(uA.getId(), UpdateUserRequest.builder()
+                .username(newUsername)
+                .bio("Updated bio")
+                .build());
+
+        assertEquals(newUsername, updated.getUsername());
+        assertEquals("Updated bio", updated.getBio());
     }
 }

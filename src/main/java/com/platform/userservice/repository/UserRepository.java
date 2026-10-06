@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -25,6 +26,22 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     boolean existsByEmail(String email);
 
     boolean existsByPhone(String phone);
+
+    /**
+     * Single query check to find any existing users matching the given username, email, or phone.
+     * Prevents 3 sequential database round-trips during registration.
+     */
+    @Query("""
+            SELECT u.username, u.email, u.phone
+            FROM User u
+            WHERE u.username = :username
+               OR (:email IS NOT NULL AND u.email = :email)
+               OR (:phone IS NOT NULL AND u.phone = :phone)
+            """)
+    List<Object[]> findExistingIdentifiers(
+            @Param("username") String username,
+            @Param("email") String email,
+            @Param("phone") String phone);
 
     /**
      * Search users using PostgreSQL pg_trgm similarity and prefix/substring matching.

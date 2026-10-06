@@ -1,5 +1,6 @@
 package com.platform.userservice.exception;
 
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
@@ -22,6 +23,21 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(DuplicateResourceException.class)
     public ResponseEntity<Map<String, Object>> handleDuplicateResource(DuplicateResourceException ex) {
         return buildResponse(HttpStatus.CONFLICT, ex.getMessage(), null);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String, Object>> handleDataIntegrityViolation(DataIntegrityViolationException ex) {
+        String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
+        if (msg.contains("username")) {
+            return buildResponse(HttpStatus.CONFLICT, "Username is already taken", null);
+        }
+        if (msg.contains("email")) {
+            return buildResponse(HttpStatus.CONFLICT, "Email is already in use", null);
+        }
+        if (msg.contains("phone")) {
+            return buildResponse(HttpStatus.CONFLICT, "Phone number is already in use", null);
+        }
+        return buildResponse(HttpStatus.CONFLICT, "A resource with these details already exists", null);
     }
 
     @ExceptionHandler(ResourceNotFoundException.class)
