@@ -4,7 +4,7 @@
 - Framework: Spring Boot 3.x / 4.x, Java 21
 - Database: PostgreSQL 17 (Relational core + JSONB attributes + `pg_trgm` GIN indexes for fuzzy search)
 - Caching & Sessions: Redis 7 (`spring-boot-starter-data-redis` + `StringRedisTemplate`)
-- Messaging: Apache Kafka (Transactional Outbox pattern planned)
+- Messaging: Apache Kafka (KRaft mode) + Transactional Outbox Pattern (`outbox_events` table + scheduled publisher)
 - Object Storage: S3 / MinIO via AWS SDK v2 (`software.amazon.awssdk:s3:2.29.50`)
 - Google Auth: Google API Client library (`com.google.api-client:google-api-client:2.7.0`)
 - Security: Spring Security Crypto (`BCryptPasswordEncoder`) + JJWT 0.12.6 + `JwtAuthenticationFilter`
@@ -42,6 +42,19 @@
     - `details` (JSONB)
     - `created_at` (TIMESTAMP)
 
+4. `outbox_events` Table:
+    - `id` (UUID PK)
+    - `aggregate_type` (VARCHAR 50, e.g. "USER")
+    - `aggregate_id` (VARCHAR 100, user UUID)
+    - `event_type` (VARCHAR 100, e.g. "USER_REGISTERED", "USER_DEACTIVATED")
+    - `topic` (VARCHAR 100, e.g. "user.registered.v1", "user.deactivated.v1")
+    - `payload` (TEXT / JSON)
+    - `status` (ENUM: PENDING, PUBLISHED, FAILED)
+    - `retry_count` (INT, default 0)
+    - `error_message` (TEXT, nullable)
+    - `created_at` (TIMESTAMP), `processed_at` (TIMESTAMP, nullable)
+    - Indexes: `(status, created_at)` and `(aggregate_type, aggregate_id)`
+
 ## 4. Search Architecture (`pg_trgm`)
 - PostgreSQL `pg_trgm` extension enabled automatically via `DatabaseInitializer`.
 - Native inverted GIN indexes on `username` and `bio`.
@@ -67,26 +80,39 @@
 - Passwords hashed using `BCryptPasswordEncoder`.
 - Google OAuth: Verifies Google ID tokens via `POST /api/v1/auth/google`, auto-provisions or links existing accounts.
 
-## 6. S3 / MinIO Profile Picture Presigned URLs
+## 6. S3 / MinIO Profile Picture Presigned URLs & Storage Lifecycle
 - Direct-to-storage architecture offloads heavy binary transfers from the Spring Boot application.
-- `S3Config` + `S3Presigner` generates AWS SigV4 signed PUT URLs for any S3-compatible store (AWS S3, MinIO, Cloudflare R2).
+- `S3Config` provides both `S3Presigner` (for client SigV4 upload URL signing) and `S3Client` (for backend operations like deletion).
 - `POST /api/v1/users/me/avatar/presigned-url`:
   - Enforces `user-policy.yml` maximum size limits (5 MB).
   - Enforces allowed MIME types (`image/jpeg`, `image/png`, `image/webp`).
   - Generates partitioned S3 key `avatars/{userId}/{randomUUID}.{ext}`.
-  - Returns presigned `uploadUrl`, public `fileUrl`, and `expiresAt` (15 minutes).
+  - Returns presigned `uploadUrl`, public `fileUrl`, `s3Key`, and `expiresAt` (15 minutes).
+- **Automatic Storage Lifecycle & Orphan Prevention**:
+  - When user updates profile with a new `pictureUrl` via `UserService.updateUserProfile`, the old `s3Key` is parsed and `AvatarStorageService.deleteAvatar` immediately removes the previous image from S3/MinIO.
+  - Storage deletion exceptions are safely caught so S3 connection blips do not fail user profile updates.
 
-## 7. Current Progress
-- Configured: `user-policy.yml`, `application.properties`, and `UserPolicyConfig`
-- Entities defined: `User`, `UserFollow`, `UserFollowId`, `UserAuditLog`
-- Repositories implemented: `UserRepository` (with `findExistingIdentifiers` and `pg_trgm` search), `UserFollowRepository`, `UserAuditLogRepository`
-- DatabaseInitializer: Guarantees `pg_trgm` and GIN indexes exist on startup
-- DTOs & Custom Exceptions: `RegisterRequest`, `LoginRequest`, `GoogleAuthRequest`, `UserResponse`, `UpdateUserRequest`, `UserSearchResponse`, `UserFollowResponse`, `AvatarPresignedUrlRequest`, `AvatarPresignedUrlResponse`, `GlobalExceptionHandler`
-- Business Services: `PolicyValidatorService`, `GoogleAuthService`, `UserService`, `UserFollowService`, `JwtTokenService`, `RedisSessionService`, `AvatarStorageService`
-- Security Filter & Context: `JwtAuthenticationFilter`, `UserContext`
-- REST Controllers: `AuthController`, `UserController`, `UserFollowController`
-- Automated Tests: 15 tests passing verifying registration, auditing, pg_trgm search, complete auth cookie lifecycles, Redis token rotation & instant revocation, spoofing prevention, and S3 presigned URL generation.
+## 7. Apache Kafka & Transactional Outbox Pattern
+- **Atomic Event Publishing**:
+  - Outbox records are inserted into `outbox_events` within the same DB transaction as business logic via `@Transactional(propagation = Propagation.MANDATORY)` in `OutboxService`.
+  - Prevents dual-write failures (e.g. database commits but Kafka is down).
+- **Events Published**:
+  - `user.registered.v1`: Aggregate ID, username, email, phone, timestamp.
+  - `user.deactivated.v1`: Aggregate ID, username, disabledAt timestamp.
+- **Outbox Publisher Scheduler**:
+  - `OutboxPublisherService` runs periodically (`@Scheduled(fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}")`).
+  - Polls batches of `PENDING` events.
+  - Emits asynchronously using `KafkaTemplate` with retry tracking (increments `retryCount`, marks `FAILED` after 5 attempts).
+  - On delivery ack, flips status to `PUBLISHED` with `processedAt` timestamp.
 
-## 8. Next Tasks
-1. Apache Kafka Event Publishing (Transactional Outbox pattern for domain events: `USER_REGISTERED`, `USER_DEACTIVATED`).
-2. Complete `docker-compose.yml` orchestrating PostgreSQL, Redis, MinIO, and Kafka (KRaft).
+## 8. Container Orchestration (`docker-compose.yml`)
+- Multi-container environment orchestrating:
+  - `postgres`: PostgreSQL 17-alpine with database healthcheck (`pg_isready`).
+  - `redis`: Redis 7-alpine with ping healthcheck.
+  - `minio`: MinIO object storage with automatic console on port 9001 and live healthcheck.
+  - `create-buckets`: One-shot `minio/mc` container automatically creating `user-avatars` bucket with public read access.
+  - `kafka`: Apache Kafka 3.8.0 in KRaft mode (no Zookeeper required) with broker API healthcheck.
+
+## 9. Current Progress
+- All 19 unit & integration tests passing (`BUILD SUCCESS`).
+- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Security Anti-Spoofing, S3 Presigned URLs & Cleanup, and Kafka Transactional Outbox.

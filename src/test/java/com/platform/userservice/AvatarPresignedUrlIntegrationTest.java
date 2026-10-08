@@ -3,10 +3,14 @@ package com.platform.userservice;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.platform.userservice.context.UserContext;
 import com.platform.userservice.dto.AvatarPresignedUrlRequest;
+import com.platform.userservice.dto.UpdateUserRequest;
+import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.entity.User;
 import com.platform.userservice.filter.JwtAuthenticationFilter;
 import com.platform.userservice.repository.UserRepository;
+import com.platform.userservice.service.AvatarStorageService;
 import com.platform.userservice.service.JwtTokenService;
+import com.platform.userservice.service.UserService;
 import com.platform.userservice.util.CookieUtil;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.BeforeEach;
@@ -21,6 +25,7 @@ import org.springframework.web.context.WebApplicationContext;
 
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -44,6 +49,12 @@ class AvatarPresignedUrlIntegrationTest {
 
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private UserService userService;
+
+    @Autowired
+    private AvatarStorageService avatarStorageService;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private User testUser;
@@ -132,5 +143,24 @@ class AvatarPresignedUrlIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void testUpdateProfile_DeletesOldAvatarFromStorage() {
+        // Given existing user has an old avatar
+        String oldAvatar = "http://localhost:9000/user-avatars/avatars/" + testUser.getId() + "/old-avatar.png";
+        testUser.setPictureUrl(oldAvatar);
+        userRepository.save(testUser);
+
+        // When user updates to a new avatar
+        String newAvatar = "http://localhost:9000/user-avatars/avatars/" + testUser.getId() + "/new-avatar.png";
+        UpdateUserRequest updateRequest = UpdateUserRequest.builder()
+                .pictureUrl(newAvatar)
+                .build();
+
+        UserResponse response = userService.updateUserProfile(testUser.getId(), updateRequest);
+
+        // Then new avatar is saved and old avatar is cleaned up without exception
+        assertThat(response.getPictureUrl()).isEqualTo(newAvatar);
     }
 }

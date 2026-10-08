@@ -8,6 +8,8 @@ import com.platform.userservice.dto.UserSearchResponse;
 import com.platform.userservice.entity.FollowStatus;
 import com.platform.userservice.entity.User;
 import com.platform.userservice.entity.UserAuditLog;
+import com.platform.userservice.event.UserDeactivatedEvent;
+import com.platform.userservice.event.UserRegisteredEvent;
 import com.platform.userservice.exception.DuplicateResourceException;
 import com.platform.userservice.exception.InvalidTokenException;
 import com.platform.userservice.exception.ResourceNotFoundException;
@@ -16,6 +18,7 @@ import com.platform.userservice.repository.UserFollowRepository;
 import com.platform.userservice.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -40,6 +43,14 @@ public class UserService {
     private final PolicyValidatorService policyValidator;
     private final PasswordEncoder passwordEncoder;
     private final RedisSessionService redisSessionService;
+    private final AvatarStorageService avatarStorageService;
+    private final OutboxService outboxService;
+
+    @Value("${kafka.topics.user-registered:user.registered.v1}")
+    private String userRegisteredTopic;
+
+    @Value("${kafka.topics.user-deactivated:user.deactivated.v1}")
+    private String userDeactivatedTopic;
 
     @Transactional
     public UserResponse registerUser(RegisterRequest request, String clientIp, String userAgent) {
@@ -89,6 +100,22 @@ public class UserService {
                 ))
                 .build();
         auditLogRepository.save(auditLog);
+
+        // Transactional Outbox pattern: Save domain event in the same atomic DB transaction
+        outboxService.saveEvent(
+                "USER",
+                user.getId().toString(),
+                "USER_REGISTERED",
+                userRegisteredTopic,
+                UserRegisteredEvent.builder()
+                        .eventId(UUID.randomUUID())
+                        .userId(user.getId())
+                        .username(user.getUsername())
+                        .email(user.getEmail())
+                        .phone(user.getPhone())
+                        .timestamp(Instant.now())
+                        .build()
+        );
 
         return toUserResponse(user, user.getId());
     }
@@ -161,8 +188,14 @@ public class UserService {
         if (request.getBio() != null) {
             user.setBio(request.getBio());
         }
-        if (request.getPictureUrl() != null) {
+        if (request.getPictureUrl() != null && !request.getPictureUrl().equals(user.getPictureUrl())) {
+            String oldPictureUrl = user.getPictureUrl();
             user.setPictureUrl(request.getPictureUrl());
+
+            // Clean up previous avatar from S3 / MinIO storage
+            if (StringUtils.hasText(oldPictureUrl)) {
+                avatarStorageService.deleteAvatar(oldPictureUrl);
+            }
         }
         if (request.getIsPrivate() != null) {
             user.setPrivate(request.getIsPrivate());
@@ -206,6 +239,20 @@ public class UserService {
                 .details(Map.of("timestamp", Instant.now().toString()))
                 .build();
         auditLogRepository.save(auditLog);
+
+        // Transactional Outbox pattern: Save domain event in the same atomic DB transaction
+        outboxService.saveEvent(
+                "USER",
+                user.getId().toString(),
+                "USER_DEACTIVATED",
+                userDeactivatedTopic,
+                UserDeactivatedEvent.builder()
+                        .eventId(UUID.randomUUID())
+                        .userId(user.getId())
+                        .username(user.getUsername())
+                        .disabledAt(user.getDisabledAt())
+                        .build()
+        );
     }
 
     @Transactional(readOnly = true)

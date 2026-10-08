@@ -6,6 +6,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
@@ -21,6 +24,7 @@ import java.util.UUID;
 public class AvatarStorageService {
 
     private final S3Presigner s3Presigner;
+    private final S3Client s3Client;
     private final PolicyValidatorService policyValidator;
 
     @Value("${storage.s3.bucket-name:user-avatars}")
@@ -66,6 +70,34 @@ public class AvatarStorageService {
                 .s3Key(s3Key)
                 .expiresAt(expiresAt)
                 .build();
+    }
+
+    public void deleteAvatar(String pictureUrl) {
+        if (!StringUtils.hasText(pictureUrl)) {
+            return;
+        }
+
+        try {
+            String prefix = "/" + bucketName + "/";
+            int index = pictureUrl.indexOf(prefix);
+            String s3Key;
+            if (index != -1) {
+                s3Key = pictureUrl.substring(index + prefix.length());
+            } else if (pictureUrl.startsWith("avatars/")) {
+                s3Key = pictureUrl;
+            } else {
+                log.warn("Could not determine S3 key from pictureUrl: {}", pictureUrl);
+                return;
+            }
+
+            s3Client.deleteObject(DeleteObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(s3Key)
+                    .build());
+            log.info("Successfully deleted avatar from S3 with key: {}", s3Key);
+        } catch (Exception ex) {
+            log.error("Failed to delete avatar from S3 (url: {}): {}", pictureUrl, ex.getMessage());
+        }
     }
 
     private String extractExtension(String fileName) {
