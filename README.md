@@ -24,6 +24,7 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
   - [3. Transactional Outbox Domain Event Publishing](#3-transactional-outbox-domain-event-publishing)
 - [Database Schema & Search Indexing](#-database-schema--search-indexing)
 - [Configuration & Policy Engine](#-configuration--policy-engine)
+- [Environment Variables (Production Deployment)](#-environment-variables-production-deployment)
 - [API Reference](#-api-reference)
 - [Local Infrastructure Setup (Docker Compose)](#-local-infrastructure-setup-docker-compose)
 - [Building & Running Locally](#-building--running-locally)
@@ -301,6 +302,33 @@ user-policy:
   deactivation:
     grace-period-days: 30
 ```
+
+---
+
+## 🌐 Environment Variables (Production Deployment)
+
+The service follows the **12-Factor App methodology**. Every configuration parameter supports environment variable overrides with local defaults (`${ENV_VAR:default}`):
+
+| Environment Variable | Description | Local Default | Production Recommendation |
+| :--- | :--- | :--- | :--- |
+| `DB_URL` | JDBC URL for PostgreSQL | `jdbc:postgresql://localhost:5432/userServiceDB` | Cloud managed DB (e.g. AWS RDS) |
+| `DB_USERNAME` | PostgreSQL username | `postgres` | Least-privileged database user |
+| `DB_PASSWORD` | PostgreSQL password | `password` | Injected via Secret Manager |
+| `JPA_DDL_AUTO` | Hibernate schema mode | `update` | `validate` or `none` |
+| `JPA_SHOW_SQL` | Hibernate SQL logging | `true` | `false` |
+| `REDIS_HOST` | Redis cache hostname | `localhost` | AWS ElastiCache / Redis cluster |
+| `REDIS_PORT` | Redis port | `6379` | `6379` |
+| `REDIS_PASSWORD` | Redis password / AUTH token | *(empty)* | Secure Redis auth secret |
+| `JWT_SECRET` | HMAC-SHA256 signature key | *(32+ char key)* | 256-bit cryptographically random secret |
+| `JWT_COOKIE_SECURE` | Enable `Secure` cookie flag | `false` | **`true`** (Strictly required for HTTPS) |
+| `GATEWAY_SHARED_SECRET` | Secret for `X-Gateway-Secret` | `local-dev-gateway-secret` | High-entropy gateway token |
+| `S3_ENDPOINT` | MinIO or AWS S3 endpoint | `http://localhost:9000` | Empty or `https://s3.us-east-1.amazonaws.com` |
+| `S3_REGION` | S3 AWS region | `us-east-1` | Target AWS region |
+| `S3_BUCKET_NAME` | S3 bucket for avatars | `user-avatars` | Production S3 bucket name |
+| `S3_ACCESS_KEY` | S3 Access Key ID | `minioadmin` | AWS IAM role / access key |
+| `S3_SECRET_KEY` | S3 Secret Access Key | `minioadmin` | AWS IAM secret access key |
+| `S3_PATH_STYLE_ACCESS` | Use path-style S3 URLs | `true` (MinIO) | `false` (AWS S3 virtual hosted style) |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address list | `localhost:9092` | Managed Kafka (e.g. AWS MSK, Confluent) |
 
 ---
 

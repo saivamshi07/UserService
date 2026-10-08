@@ -14,6 +14,7 @@
 - Injected via `spring.config.import=classpath:user-policy.yml` in `application.properties`
 - Properties mapped to `@ConfigurationProperties(prefix = "user-policy") UserPolicyConfig`
 - Config toggles: Auth modes (EITHER, BOTH, ONLY_EMAIL, ONLY_PHONE), name validation regex/length, bio limits, profile picture restrictions (5MB, JPEG/PNG/WEBP), privacy toggles, deactivation rules, Google OAuth toggle (`allow-google: true`).
+- **12-Factor Cloud Readiness**: All parameters in `application.properties` utilize `${ENV_VAR:local_default}` syntax, enabling zero-code overrides across Docker, Kubernetes, AWS, and GCP.
 
 ## 3. Database Schema & Entities
 1. `users` Table:
@@ -105,14 +106,15 @@
   - Emits asynchronously using `KafkaTemplate` with retry tracking (increments `retryCount`, marks `FAILED` after 5 attempts).
   - On delivery ack, flips status to `PUBLISHED` with `processedAt` timestamp.
 
-## 8. Container Orchestration (`docker-compose.yml`)
+## 8. Container Orchestration & Cloud Deployment
 - Multi-container environment orchestrating:
   - `postgres`: PostgreSQL 17-alpine with database healthcheck (`pg_isready`).
   - `redis`: Redis 7-alpine with ping healthcheck.
   - `minio`: MinIO object storage with automatic console on port 9001 and live healthcheck.
   - `create-buckets`: One-shot `minio/mc` container automatically creating `user-avatars` bucket with public read access.
   - `kafka`: Apache Kafka 3.8.0 in KRaft mode (no Zookeeper required) with broker API healthcheck.
+- 12-Factor externalized environment variable matrix configured in `application.properties`.
 
 ## 9. Current Progress
 - All 19 unit & integration tests passing (`BUILD SUCCESS`).
-- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Security Anti-Spoofing, S3 Presigned URLs & Cleanup, and Kafka Transactional Outbox.
+- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Security Anti-Spoofing, S3 Presigned URLs & Cleanup, Kafka Transactional Outbox, and externalized config bindings.
