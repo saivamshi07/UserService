@@ -1,8 +1,11 @@
 package com.platform.userservice.controller;
 
 import com.platform.userservice.context.UserContext;
+import com.platform.userservice.dto.BatchAccessContextRequest;
+import com.platform.userservice.dto.BatchAccessContextResponse;
 import com.platform.userservice.dto.FollowDecisionRequest;
 import com.platform.userservice.dto.FollowUserRequest;
+import com.platform.userservice.dto.UserAccessCheckResponse;
 import com.platform.userservice.dto.UserFollowResponse;
 import com.platform.userservice.service.UserFollowService;
 import jakarta.validation.Valid;
@@ -17,6 +20,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.UUID;
@@ -97,5 +101,29 @@ public class UserFollowController {
             @PathVariable("id") UUID userId,
             @PageableDefault(size = 20) Pageable pageable) {
         return ResponseEntity.ok(userFollowService.getFollowing(userId, pageable));
+    }
+
+    /**
+     * Single relationship check: tests if a viewer is authorized to view an author's private reviews/ratings.
+     */
+    @GetMapping("/{id}/access-check")
+    public ResponseEntity<UserAccessCheckResponse> checkAccess(
+            @PathVariable("id") UUID authorId,
+            @RequestParam(name = "viewerId", required = false) UUID viewerId) {
+        UUID effectiveViewerId = viewerId != null ? viewerId : UserContext.getUserId();
+        return ResponseEntity.ok(userFollowService.checkAccess(authorId, effectiveViewerId));
+    }
+
+    /**
+     * Batch access context endpoint for downstream services (e.g. movie-service):
+     * Resolves author privacy flags and viewer following sets in bulk, warming the dedicated Redis cache.
+     */
+    @PostMapping("/access-context")
+    public ResponseEntity<BatchAccessContextResponse> getBatchAccessContext(
+            @RequestBody BatchAccessContextRequest request) {
+        if (request.getViewerId() == null && UserContext.getUserId() != null) {
+            request.setViewerId(UserContext.getUserId());
+        }
+        return ResponseEntity.ok(userFollowService.getBatchAccessContext(request));
     }
 }

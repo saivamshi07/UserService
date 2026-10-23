@@ -109,12 +109,22 @@
 ## 8. Container Orchestration & Cloud Deployment
 - Multi-container environment orchestrating:
   - `postgres`: PostgreSQL 17-alpine with database healthcheck (`pg_isready`).
-  - `redis`: Redis 7-alpine with ping healthcheck.
+  - `redis`: Redis 7-alpine with ping healthcheck (Auth sessions & token revocation on port 6379).
+  - `graph-redis`: Dedicated Redis 7-alpine container running on port 6380 for follower graphs and user privacy flags, isolated from auth session memory.
   - `minio`: MinIO object storage with automatic console on port 9001 and live healthcheck.
   - `create-buckets`: One-shot `minio/mc` container automatically creating `user-avatars` bucket with public read access.
   - `kafka`: Apache Kafka 3.8.0 in KRaft mode (no Zookeeper required) with broker API healthcheck.
 - 12-Factor externalized environment variable matrix configured in `application.properties`.
 
-## 9. Current Progress
-- All 19 unit & integration tests passing (`BUILD SUCCESS`).
-- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Security Anti-Spoofing, S3 Presigned URLs & Cleanup, Kafka Transactional Outbox, and externalized config bindings.
+## 9. Dedicated Social Graph Redis & Downstream Access APIs
+- **Dedicated Graph Cache (`UserGraphRedisService`)**:
+  - `graph:user:{userId}:following` -> Redis Set of target UUIDs the user follows. Contains `__EMPTY__` sentinel for users following 0 people to prevent cache penetration.
+  - `graph:user:{userId}:privacy` -> Redis String (`PRIVATE` or `PUBLIC`).
+  - Updated atomically on `followUser` (accepted only), `unfollowUser`, `respondToFollowRequest`, `registerUser`, `updateUserProfile` (isPrivate toggle), and `deactivateUser` (eviction).
+- **APIs for Downstream Services (`movie-service`)**:
+  - `GET /api/v1/users/{authorId}/access-check?viewerId={viewerId}`: Instant single check evaluating `(!isPrivate || viewer == author || isFollowing)`.
+  - `POST /api/v1/users/access-context`: Batch resolution of multiple author privacy flags and viewer following sets in a single call, warming any missing Redis cache keys automatically.
+
+## 10. Current Progress
+- All 23 unit & integration tests passing (`BUILD SUCCESS`).
+- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Dedicated Graph Redis, Access Check & Batch Context APIs, S3 Presigned URLs & Cleanup, Kafka Transactional Outbox, and externalized config bindings.

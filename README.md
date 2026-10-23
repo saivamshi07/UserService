@@ -10,7 +10,7 @@
 
 An enterprise-grade, event-driven **User & Identity Microservice** built with **Spring Boot**, **PostgreSQL 17**, **Redis 7**, **MinIO/S3**, and **Apache Kafka**.
 
-Designed with strict zero-trust security, dual-write consistency via the **Transactional Outbox Pattern**, fuzzy trigram full-text search, direct-to-cloud presigned avatar uploads, and dynamic policy enforcement.
+Designed with strict zero-trust security, dual-write consistency via the **Transactional Outbox Pattern**, fuzzy trigram full-text search, direct-to-cloud presigned avatar uploads, dynamic policy enforcement, and a **dedicated Social Graph Redis cache** for high-performance downstream authorization (e.g. `movie-service`).
 
 ---
 
@@ -20,8 +20,9 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 - [Tech Stack](#-tech-stack)
 - [System Workflows](#-system-workflows)
   - [1. Authentication & Redis Session Lifecycle](#1-authentication--redis-session-lifecycle)
-  - [2. Direct S3/MinIO Avatar Upload Flow](#2-direct-s3minio-avatar-upload-flow)
-  - [3. Transactional Outbox Domain Event Publishing](#3-transactional-outbox-domain-event-publishing)
+  - [2. Dedicated Social Graph Cache & Downstream Access Checks](#2-dedicated-social-graph-cache--downstream-access-checks)
+  - [3. Direct S3/MinIO Avatar Upload Flow](#3-direct-s3minio-avatar-upload-flow)
+  - [4. Transactional Outbox Domain Event Publishing](#4-transactional-outbox-domain-event-publishing)
 - [Database Schema & Search Indexing](#-database-schema--search-indexing)
 - [Configuration & Policy Engine](#-configuration--policy-engine)
 - [Environment Variables (Production Deployment)](#-environment-variables-production-deployment)
@@ -32,38 +33,30 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 
 ---
 
-## 🏛 Architecture Overview
+## 🏛️ Architecture Overview
 
 ```
                                   ┌─────────────────────────────┐
-                                  │      API Gateway / Client   │
+                                  │    API Gateway / Clients    │
                                   └──────────────┬──────────────┘
                                                  │
-                                                 ▼
-             ┌───────────────────────────────────────────────────────────────────────┐
-             │                          USER SERVICE CORE                            │
-             │                                                                       │
-             │   ┌───────────────────────┐         ┌───────────────────────────────┐ │
-             │   │ JwtAuthentication     │         │ PolicyValidatorService        │ │
-             │   │ Filter & UserContext  │         │ (user-policy.yml)             │ │
-             │   └───────────┬───────────┘         └───────────────────────────────┘ │
-             │               │                                                       │
-             │   ┌───────────▼───────────┐         ┌───────────────────────────────┐ │
-             │   │ REST Controllers      │         │ OutboxPublisherService        │ │
-             │   │ (Auth, User, Follow)  │         │ (Scheduled Batch Poller)      │ │
-             │   └───────────┬───────────┘         └──────────────┬────────────────┘ │
-             └───────────────┼────────────────────────────────────┼──────────────────┘
-                             │                                    │
-           ┌─────────────────┼─────────────────┐                  │
-           ▼                 ▼                 ▼                  ▼
-    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐    ┌─────────────┐
-    │ PostgreSQL  │   │   Redis 7   │   │ MinIO / S3  │    │ Kafka Broker│
-    │  Database   │   │  Sessions   │   │ Storage     │    │  (KRaft)    │
-    │             │   │  & Token    │   │ Presigned   │    │             │
-    │ • users     │   │  Revocation │   │ Avatar URLs │    │ • registered│
-    │ • outbox    │   │             │   │             │    │ • deactivate│
-    │ • follows   │   │             │   │             │    │             │
-    └─────────────┘   └─────────────┘   └─────────────┘    └─────────────┘
+                        ┌────────────────────────┴────────────────────────┐
+                        ▼                                                 ▼
+             ┌─────────────────────┐                           ┌─────────────────────┐
+             │    user-service     │                           │  Downstream Service │
+             │    (Spring Boot)    │                           │ (e.g. movie-service)│
+             └──────────┬──────────┘                           └──────────┬──────────┘
+                        │                                                 │
+      ┌─────────────────┼────────────────────────┐                        │ Read-Only
+      ▼                 ▼                        ▼                        ▼
+┌───────────┐     ┌───────────┐            ┌───────────┐            ┌───────────┐
+│PostgreSQL │     │  Redis 7  │            │  Kafka    │            │Graph Redis│
+│ Database  │     │ (Auth &   │            │  Broker   │            │ (Port 6380│
+│           │     │ Sessions) │            │  (KRaft)  │            │ Followers)│
+│• users    │     │:6379      │            │           │            │           │
+│• outbox   │     └───────────┘            │•registered│            │• following│
+│• follows  │                              │•deactivate│            │• privacy  │
+└───────────┘                              └───────────┘            └───────────┘
 ```
 
 ---
@@ -79,6 +72,12 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 - **Anti-Spoofing Context**: `JwtAuthenticationFilter` validates caller identity and enforces trusted boundary verification before population of the thread-local `UserContext`.
 - **Google OAuth Integration**: Native Google ID Token verification (`com.google.api-client`), auto-provisioning new accounts or linking existing email identities.
 
+### 👥 Dedicated Social Graph Redis & Downstream Authorization
+- **Isolated Graph Cache**: Dedicated Redis container on port `6380` isolated from auth sessions, eliminating blast radius and session eviction risks.
+- **Real-Time Consistency**: Follow, unfollow, accept/reject, registration, and privacy toggles update the graph cache synchronously.
+- **Anti-Penetration Sentinel**: Users following 0 people store an `__EMPTY__` sentinel to prevent cache misses on empty sets.
+- **Downstream Batched APIs**: Downstream services (e.g. `movie-service`) can fetch viewer followings and multiple author privacy flags via `POST /api/v1/users/access-context` with automatic DB-to-Redis cache warming.
+
 ### 🔍 PostgreSQL Trigram Fuzzy Search (`pg_trgm`)
 - Native inverted **GIN trigram indexes** (`idx_users_username_trgm`, `idx_users_bio_trgm`) provisioned on startup via `DatabaseInitializer`.
 - Typo-tolerant substring and similarity search scoring (`similarity(username, :q) > 0.2`) with exact prefix boosting.
@@ -93,11 +92,6 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 - Domain events (`user.registered.v1`, `user.deactivated.v1`) are written atomically to the `outbox_events` table inside the exact same database transaction as business logic.
 - Background scheduled poller (`OutboxPublisherService`) batches pending events, publishes them to Kafka with retry counters, and marks records `PUBLISHED` upon delivery confirmation.
 
-### 👥 Social Follow System
-- Request/Accept/Reject workflow for **private accounts**.
-- Instant follow for **public accounts**.
-- Unfollow, follower count, and paginated follower/following listings.
-
 ---
 
 ## 🛠 Tech Stack
@@ -107,7 +101,8 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 | **Language** | Java (OpenJDK) | 21 |
 | **Framework** | Spring Boot | 4.1.1 |
 | **Database** | PostgreSQL | 17 (Alpine) |
-| **Caching / Sessions** | Redis | 7 (Alpine) |
+| **Auth Caching & Sessions** | Redis | 7 (Alpine, Port 6379) |
+| **Social Graph Cache** | Redis | 7 (Alpine, Port 6380) |
 | **Event Streaming** | Apache Kafka (KRaft mode) | 3.8.0 |
 | **Object Storage** | MinIO / AWS S3 (AWS SDK v2) | 2.29.50 |
 | **Security & JWT** | JJWT (io.jsonwebtoken) | 0.12.6 |
@@ -127,7 +122,7 @@ sequenceDiagram
     actor Client
     participant Auth as AuthController
     participant UserSvc as UserService
-    participant Redis as RedisSessionService
+    participant Redis as RedisSessionService (:6379)
     participant DB as PostgreSQL
 
     Client->>Auth: POST /api/v1/auth/login (username/email/phone, password)
@@ -149,7 +144,37 @@ sequenceDiagram
 
 ---
 
-### 2. Direct S3/MinIO Avatar Upload Flow
+### 2. Dedicated Social Graph Cache & Downstream Access Checks
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Downstream as movie-service
+    participant GraphRedis as Graph Redis (:6380)
+    participant UserCtrl as UserFollowController
+    participant DB as PostgreSQL
+
+    Note over Client,Downstream: Movie Reviews Feed Request
+    Client->>Downstream: GET /api/v1/movies/123/reviews (viewerId)
+    Downstream->>GraphRedis: MGET graph:user:{authorId}:privacy & SMEMBERS graph:user:{viewerId}:following
+    
+    alt Cache Miss in Graph Redis
+        Downstream->>UserCtrl: POST /api/v1/users/access-context (viewerId, authorIds)
+        UserCtrl->>DB: Fetch missing privacy flags & following links
+        UserCtrl->>GraphRedis: Warm missing keys (MSET privacy, SADD following)
+        UserCtrl-->>Downstream: 200 OK (BatchAccessContextResponse)
+    else Cache Hit
+        GraphRedis-->>Downstream: Privacy flags & Following set (< 1ms)
+    end
+
+    Note over Downstream: Filter: If private & author != viewer & not followed -> hide
+    Downstream-->>Client: Return Filtered Reviews
+```
+
+---
+
+### 3. Direct S3/MinIO Avatar Upload Flow
 
 ```mermaid
 sequenceDiagram
@@ -177,7 +202,7 @@ sequenceDiagram
 
 ---
 
-### 3. Transactional Outbox Domain Event Publishing
+### 4. Transactional Outbox Domain Event Publishing
 
 ```mermaid
 sequenceDiagram
@@ -316,9 +341,12 @@ The service follows the **12-Factor App methodology**. Every configuration param
 | `DB_PASSWORD` | PostgreSQL password | `password` | Injected via Secret Manager |
 | `JPA_DDL_AUTO` | Hibernate schema mode | `update` | `validate` or `none` |
 | `JPA_SHOW_SQL` | Hibernate SQL logging | `true` | `false` |
-| `REDIS_HOST` | Redis cache hostname | `localhost` | AWS ElastiCache / Redis cluster |
-| `REDIS_PORT` | Redis port | `6379` | `6379` |
-| `REDIS_PASSWORD` | Redis password / AUTH token | *(empty)* | Secure Redis auth secret |
+| `REDIS_HOST` | Auth Redis hostname | `localhost` | AWS ElastiCache / Redis cluster |
+| `REDIS_PORT` | Auth Redis port | `6379` | `6379` |
+| `REDIS_PASSWORD` | Auth Redis password | *(empty)* | Secure Redis auth secret |
+| `GRAPH_REDIS_HOST` | Dedicated Graph Redis hostname | `${REDIS_HOST}` | Independent Graph Redis cluster |
+| `GRAPH_REDIS_PORT` | Dedicated Graph Redis port | `6380` (6379 test) | `6380` |
+| `GRAPH_REDIS_DATABASE` | Graph Redis logical DB index | `1` | `0` or isolated DB |
 | `JWT_SECRET` | HMAC-SHA256 signature key | *(32+ char key)* | 256-bit cryptographically random secret |
 | `JWT_COOKIE_SECURE` | Enable `Secure` cookie flag | `false` | **`true`** (Strictly required for HTTPS) |
 | `GATEWAY_SHARED_SECRET` | Secret for `X-Gateway-Secret` | `local-dev-gateway-secret` | High-entropy gateway token |
@@ -392,9 +420,37 @@ The service follows the **12-Factor App methodology**. Every configuration param
 | :--- | :--- | :--- | :---: |
 | `POST` | `/api/v1/users/follows` | Follow a user (body: `{ "targetUserId": "..." }`) | **Yes** |
 | `DELETE` | `/api/v1/users/follows/{targetUserId}` | Unfollow a user | **Yes** |
-| `POST` | `/api/v1/users/follows/respond` | Accept/Reject follow request (body: `{ "followerId": "...", "accept": true }`) | **Yes** |
+| `POST` | `/api/v1/users/follows/respond` | Accept/Reject follow request | **Yes** |
 | `GET` | `/api/v1/users/{id}/followers` | List paginated followers of a user | No |
 | `GET` | `/api/v1/users/{id}/following` | List paginated users followed by user | No |
+| `GET` | `/api/v1/users/{id}/access-check?viewerId={viewerId}` | Single check if viewer can see private author content | No |
+| `POST` | `/api/v1/users/access-context` | Batch fetch author privacy & viewer followings (with cache warming) | No |
+
+#### Batch Access Context Request (`POST /api/v1/users/access-context`):
+Used by downstream services (like `movie-service`) when rendering paginated review feeds:
+```json
+{
+  "viewerId": "b1a2c3d4-0000-0000-0000-000000000000",
+  "authorIds": [
+    "a1111111-0000-0000-0000-000000000000",
+    "a2222222-0000-0000-0000-000000000000"
+  ]
+}
+```
+
+#### Response:
+```json
+{
+  "viewerId": "b1a2c3d4-0000-0000-0000-000000000000",
+  "viewerFollowing": [
+    "a2222222-0000-0000-0000-000000000000"
+  ],
+  "authorPrivacy": {
+    "a1111111-0000-0000-0000-000000000000": false,
+    "a2222222-0000-0000-0000-000000000000": true
+  }
+}
+```
 
 ---
 
@@ -408,7 +464,8 @@ docker compose up -d
 
 ### Services Started:
 - **PostgreSQL 17** (`localhost:5432`): Database `userServiceDB`, User `postgres`, Password `password`.
-- **Redis 7** (`localhost:6379`): Session storage and token revocation engine.
+- **Redis 7 (Auth & Sessions)** (`localhost:6379`): Session storage and token revocation engine.
+- **Redis 7 (Social Graph)** (`localhost:6380`): Dedicated follower graph and privacy status cache.
 - **MinIO S3** (`localhost:9000`, Web UI Console: `http://localhost:9001`): User `minioadmin`, Password `minioadmin`.
 - **MinIO Bucket Auto-Init (`create-buckets`)**: Automatically provisions `user-avatars` bucket with public read access.
 - **Apache Kafka 3.8.0** (`localhost:9092`): Running in modern KRaft mode (ZooKeeper-less).
@@ -448,7 +505,8 @@ The project includes unit, repository, and end-to-end integration tests using Mo
 ./mvnw clean test
 ```
 
-### Coverage Highlights:
+### Coverage Highlights (All 23 Tests Passing):
+- **`UserAccessIntegrationTest`**: Dedicated Graph Redis real-time sync on follow/unfollow/approval, single access check evaluation, and batch access context with automatic cache warming.
 - **`AuthControllerIntegrationTest`**: Complete cookie authentication lifecycle, token rotation, and Redis instant revocation.
 - **`UserSecurityIntegrationTest`**: Strict header anti-spoofing tests, bearer token parsing, and user context isolation.
 - **`UserSearchIntegrationTest`**: Fuzzy trigram similarity search queries and username collision checks.

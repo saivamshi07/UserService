@@ -45,6 +45,7 @@ public class UserService {
     private final RedisSessionService redisSessionService;
     private final AvatarStorageService avatarStorageService;
     private final OutboxService outboxService;
+    private final UserGraphRedisService userGraphRedisService;
 
     @Value("${kafka.topics.user-registered:user.registered.v1}")
     private String userRegisteredTopic;
@@ -88,6 +89,9 @@ public class UserService {
                 .build();
 
         user = userRepository.save(user);
+
+        // Update dedicated Graph Redis with user's initial privacy status
+        userGraphRedisService.setUserPrivacy(user.getId(), user.isPrivate());
 
         UserAuditLog auditLog = UserAuditLog.builder()
                 .userId(user.getId())
@@ -214,6 +218,12 @@ public class UserService {
         }
 
         user = userRepository.save(user);
+
+        // Update dedicated Graph Redis if privacy setting changed
+        if (request.getIsPrivate() != null) {
+            userGraphRedisService.setUserPrivacy(user.getId(), user.isPrivate());
+        }
+
         return toUserResponse(user, userId);
     }
 
@@ -230,6 +240,9 @@ public class UserService {
 
         // Instantly revoke all active sessions across all devices in Redis
         redisSessionService.revokeAllUserSessions(userId);
+
+        // Evict following and privacy entries from dedicated Graph Redis
+        userGraphRedisService.evictUser(userId);
 
         UserAuditLog auditLog = UserAuditLog.builder()
                 .userId(userId)

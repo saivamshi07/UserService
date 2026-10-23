@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -42,6 +43,12 @@ public interface UserRepository extends JpaRepository<User, UUID> {
             @Param("username") String username,
             @Param("email") String email,
             @Param("phone") String phone);
+
+    /**
+     * Batch fetch privacy flags for a set of user IDs in a single query.
+     */
+    @Query("SELECT u.id, u.isPrivate FROM User u WHERE u.id IN :ids")
+    List<Object[]> findPrivacyStatusByIds(@Param("ids") Collection<UUID> ids);
 
     /**
      * Search users using PostgreSQL pg_trgm similarity and prefix/substring matching.

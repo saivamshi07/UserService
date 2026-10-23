@@ -31,6 +31,20 @@ services:
       timeout: 3s
       retries: 5
 
+  graph-redis:
+    image: redis:7-alpine
+    container_name: user-service-graph-redis
+    restart: always
+    ports:
+      - "6380:6379"
+    volumes:
+      - graph_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   minio:
     image: minio/minio:latest
     container_name: user-service-minio
@@ -94,5 +108,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  graph_redis_data:
   minio_data:
   kafka_data:
