@@ -28,6 +28,9 @@ public class KafkaConfig {
     @Value("${kafka.topics.user-deactivated:user.deactivated.v1}")
     private String userDeactivatedTopic;
 
+    @Value("${kafka.topics.password-reset-requested:user.password-reset-requested.v1}")
+    private String passwordResetTopic;
+
     @Bean
     public ProducerFactory<String, String> producerFactory() {
         Map<String, Object> configProps = new HashMap<>();
@@ -55,6 +58,14 @@ public class KafkaConfig {
     @Bean
     public NewTopic userDeactivatedTopic() {
         return TopicBuilder.name(userDeactivatedTopic)
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic passwordResetTopic() {
+        return TopicBuilder.name(passwordResetTopic)
                 .partitions(3)
                 .replicas(1)
                 .build();

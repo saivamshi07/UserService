@@ -2,6 +2,7 @@ package com.platform.userservice.service;
 
 import com.platform.userservice.dto.BatchAccessContextRequest;
 import com.platform.userservice.dto.BatchAccessContextResponse;
+import com.platform.userservice.dto.FollowStatusResponse;
 import com.platform.userservice.dto.UserAccessCheckResponse;
 import com.platform.userservice.dto.UserFollowResponse;
 import com.platform.userservice.entity.FollowStatus;
@@ -25,6 +26,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -84,6 +86,17 @@ public class UserFollowService {
         userGraphRedisService.removeFollowing(followerId, followingId);
     }
 
+    /**
+     * Removes a follower from the current user's followers list.
+     * Deletes the follow relationship and evicts the follow link from the follower's Redis following set.
+     */
+    @Transactional
+    public void removeFollower(UUID currentUserId, UUID followerId) {
+        policyValidator.validateFollowersAllowed();
+        userFollowRepository.deleteByIdFollowerIdAndIdFollowingId(followerId, currentUserId);
+        userGraphRedisService.removeFollowing(followerId, currentUserId);
+    }
+
     @Transactional
     public UserFollowResponse respondToFollowRequest(UUID followingId, UUID followerId, boolean accept) {
         policyValidator.validateFollowersAllowed();
@@ -118,6 +131,24 @@ public class UserFollowService {
     @Transactional(readOnly = true)
     public Page<UserFollowResponse> getFollowing(UUID userId, Pageable pageable) {
         return userFollowRepository.findByIdFollowerIdAndStatus(userId, FollowStatus.ACCEPTED, pageable)
+                .map(f -> toFollowResponse(f, f.getFollowing()));
+    }
+
+    /**
+     * Paginated list of incoming pending follow requests sent to the specified user.
+     */
+    @Transactional(readOnly = true)
+    public Page<UserFollowResponse> getPendingFollowRequests(UUID userId, Pageable pageable) {
+        return userFollowRepository.findByIdFollowingIdAndStatus(userId, FollowStatus.PENDING, pageable)
+                .map(f -> toFollowResponse(f, f.getFollower()));
+    }
+
+    /**
+     * Paginated list of outgoing follow requests sent by the specified user awaiting approval.
+     */
+    @Transactional(readOnly = true)
+    public Page<UserFollowResponse> getSentFollowRequests(UUID userId, Pageable pageable) {
+        return userFollowRepository.findByIdFollowerIdAndStatus(userId, FollowStatus.PENDING, pageable)
                 .map(f -> toFollowResponse(f, f.getFollowing()));
     }
 
@@ -185,6 +216,63 @@ public class UserFollowService {
                 .isPrivate(true)
                 .isFollowing(isFollowing)
                 .canView(isFollowing)
+                .build();
+    }
+
+    /**
+     * Checks whether a user is following a target user, returning the relationship status.
+     * Leverages Redis cache with DB fallback and cache warming.
+     */
+    @Transactional(readOnly = true)
+    public FollowStatusResponse getFollowStatus(UUID currentUserId, UUID targetUserId) {
+        if (!userRepository.existsById(targetUserId)) {
+            throw new ResourceNotFoundException("Target user not found: " + targetUserId);
+        }
+
+        if (currentUserId.equals(targetUserId)) {
+            return FollowStatusResponse.builder()
+                    .currentUserId(currentUserId)
+                    .targetUserId(targetUserId)
+                    .isFollowing(false)
+                    .status(null)
+                    .build();
+        }
+
+        // 1. Fast Redis check (only holds ACCEPTED following relations)
+        Boolean isFollowingCached = userGraphRedisService.isFollowing(currentUserId, targetUserId);
+        if (Boolean.TRUE.equals(isFollowingCached)) {
+            return FollowStatusResponse.builder()
+                    .currentUserId(currentUserId)
+                    .targetUserId(targetUserId)
+                    .isFollowing(true)
+                    .status(FollowStatus.ACCEPTED)
+                    .build();
+        }
+
+        // 2. Database lookup to accurately check PENDING / REJECTED or cache misses
+        Optional<UserFollow> followOpt = userFollowRepository.findByIdFollowerIdAndIdFollowingId(currentUserId, targetUserId);
+        if (followOpt.isEmpty()) {
+            return FollowStatusResponse.builder()
+                    .currentUserId(currentUserId)
+                    .targetUserId(targetUserId)
+                    .isFollowing(false)
+                    .status(null)
+                    .build();
+        }
+
+        UserFollow follow = followOpt.get();
+        boolean isFollowing = follow.getStatus() == FollowStatus.ACCEPTED;
+
+        // Warm Redis if DB has ACCEPTED but cache had a miss
+        if (isFollowing && isFollowingCached == null) {
+            userGraphRedisService.addFollowing(currentUserId, targetUserId);
+        }
+
+        return FollowStatusResponse.builder()
+                .currentUserId(currentUserId)
+                .targetUserId(targetUserId)
+                .isFollowing(isFollowing)
+                .status(follow.getStatus())
                 .build();
     }
 

@@ -21,7 +21,16 @@ public class UserResponse {
     private String phone;
     private String bio;
     private String pictureUrl;
+
+    @com.fasterxml.jackson.annotation.JsonProperty("isPrivate")
     private boolean isPrivate;
+
+    @com.fasterxml.jackson.annotation.JsonProperty("isEmailPrivate")
+    private boolean isEmailPrivate;
+
+    @com.fasterxml.jackson.annotation.JsonProperty("isPhonePrivate")
+    private boolean isPhonePrivate;
+
     private boolean isEmailVerified;
     private boolean isPhoneVerified;
     private Map<String, Object> publicProfiles;

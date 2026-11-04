@@ -30,7 +30,7 @@ public class AvatarStorageService {
     @Value("${storage.s3.bucket-name:user-avatars}")
     private String bucketName;
 
-    @Value("${storage.s3.endpoint:http://localhost:9000}")
+    @Value("${storage.s3.endpoint:http://localhost:4566}")
     private String endpoint;
 
     @Value("${storage.s3.presigned-url-expiration-minutes:15}")

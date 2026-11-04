@@ -5,11 +5,14 @@ import com.platform.userservice.context.UserContext;
 import com.platform.userservice.dto.BatchAccessContextRequest;
 import com.platform.userservice.dto.BatchAccessContextResponse;
 import com.platform.userservice.dto.FollowDecisionRequest;
+import com.platform.userservice.dto.FollowStatusResponse;
 import com.platform.userservice.dto.FollowUserRequest;
 import com.platform.userservice.dto.RegisterRequest;
 import com.platform.userservice.dto.UpdateUserRequest;
 import com.platform.userservice.dto.UserAccessCheckResponse;
 import com.platform.userservice.dto.UserResponse;
+import com.platform.userservice.entity.FollowStatus;
+import com.platform.userservice.repository.UserFollowRepository;
 import com.platform.userservice.service.UserFollowService;
 import com.platform.userservice.service.UserGraphRedisService;
 import com.platform.userservice.service.UserService;
@@ -31,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -48,6 +52,9 @@ class UserAccessIntegrationTest {
 
     @Autowired
     private UserFollowService userFollowService;
+
+    @Autowired
+    private UserFollowRepository userFollowRepository;
 
     @Autowired
     private UserGraphRedisService userGraphRedisService;
@@ -75,7 +82,7 @@ class UserAccessIntegrationTest {
     }
 
     @Test
-    void testFollowAndUnfollowUpdatesDedicatedRedis() {
+    void testFollowWorkflowUpdatesGraphRedisSynchronously() {
         UserResponse follower = registerTestUser("follower", false);
         UserResponse publicTarget = registerTestUser("pubtarget", false);
 
@@ -96,69 +103,158 @@ class UserAccessIntegrationTest {
 
     @Test
     void testPrivateUserFollowApprovalUpdatesRedis() {
-        UserResponse follower = registerTestUser("reqfollower", false);
+        UserResponse requester = registerTestUser("requester", false);
         UserResponse privateTarget = registerTestUser("privtarget", true);
 
-        // 1. Request to follow private user (Status: PENDING)
-        userFollowService.followUser(follower.getId(), privateTarget.getId());
+        // 1. Follow private user (PENDING status)
+        userFollowService.followUser(requester.getId(), privateTarget.getId());
 
-        // Should NOT be in Redis yet while PENDING
-        Boolean isFollowingPending = userGraphRedisService.isFollowing(follower.getId(), privateTarget.getId());
-        assertFalse(Boolean.TRUE.equals(isFollowingPending), "Pending follow request must not be stored as active following in Redis");
+        // Redis must NOT contain following link yet
+        Boolean isFollowing = userGraphRedisService.isFollowing(requester.getId(), privateTarget.getId());
+        assertFalse(Boolean.TRUE.equals(isFollowing), "Redis must not have follow link while PENDING");
 
-        // 2. Target user accepts follow request
-        userFollowService.respondToFollowRequest(privateTarget.getId(), follower.getId(), true);
+        // 2. Target accepts follow request
+        userFollowService.respondToFollowRequest(privateTarget.getId(), requester.getId(), true);
 
-        // Now must be in Redis
-        Boolean isFollowingAccepted = userGraphRedisService.isFollowing(follower.getId(), privateTarget.getId());
-        assertTrue(Boolean.TRUE.equals(isFollowingAccepted), "Accepted follow request must now be in Redis");
+        // Redis MUST now contain following link
+        isFollowing = userGraphRedisService.isFollowing(requester.getId(), privateTarget.getId());
+        assertTrue(Boolean.TRUE.equals(isFollowing), "Redis must contain follow link after ACCEPTED");
+
+        // 3. Check access check endpoint
+        UserAccessCheckResponse access = userFollowService.checkAccess(privateTarget.getId(), requester.getId());
+        assertTrue(access.isCanView(), "Follower should now be authorized to view private author content");
+        assertTrue(access.isFollowing());
     }
 
     @Test
-    void testSingleAccessCheckEndpoint() throws Exception {
+    void testAccessCheckEndpointsAndSelfBypass() {
+        UserResponse owner = registerTestUser("owner", true);
+        UserResponse stranger = registerTestUser("stranger", false);
+
+        // 1. Self bypass: owner viewing own private profile
+        UserAccessCheckResponse selfAccess = userFollowService.checkAccess(owner.getId(), owner.getId());
+        assertTrue(selfAccess.isCanView(), "Owner should always have access to view own content");
+        assertTrue(selfAccess.isFollowing());
+
+        // 2. Stranger viewing private profile without following
+        UserAccessCheckResponse strangerAccess = userFollowService.checkAccess(owner.getId(), stranger.getId());
+        assertFalse(strangerAccess.isCanView(), "Stranger without accepted follow must be denied");
+        assertFalse(strangerAccess.isFollowing());
+
+        // 3. Anonymous/guest viewer viewing private profile
+        UserAccessCheckResponse guestAccess = userFollowService.checkAccess(owner.getId(), null);
+        assertFalse(guestAccess.isCanView(), "Guest viewer must be denied access to private profile");
+    }
+
+    @Test
+    void testFollowStatusEndpoint() throws Exception {
         MockMvc mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext).build();
 
-        UserResponse viewer = registerTestUser("viewer", false);
-        UserResponse publicAuthor = registerTestUser("publicauthor", false);
-        UserResponse privateAuthor = registerTestUser("privateauthor", true);
+        UserResponse userA = registerTestUser("usera", false);
+        UserResponse userB = registerTestUser("userb", false);
 
-        // 1. Check access on public author -> canView: true
-        mockMvc.perform(get("/api/v1/users/{id}/access-check", publicAuthor.getId())
-                        .param("viewerId", viewer.getId().toString()))
+        UserContext.setUserId(userA.getId());
+
+        // Initially not following
+        mockMvc.perform(get("/api/v1/users/" + userB.getId() + "/follow-status"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.canView").value(true))
-                .andExpect(jsonPath("$.private").value(false));
+                .andExpect(jsonPath("$.isFollowing").value(false));
 
-        // 2. Check access on private author without following -> canView: false
-        mockMvc.perform(get("/api/v1/users/{id}/access-check", privateAuthor.getId())
-                        .param("viewerId", viewer.getId().toString()))
+        // Follow user B
+        userFollowService.followUser(userA.getId(), userB.getId());
+
+        // Now following
+        mockMvc.perform(get("/api/v1/users/" + userB.getId() + "/follow-status"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.canView").value(false))
-                .andExpect(jsonPath("$.private").value(true))
-                .andExpect(jsonPath("$.following").value(false));
+                .andExpect(jsonPath("$.isFollowing").value(true))
+                .andExpect(jsonPath("$.status").value("ACCEPTED"));
+    }
 
-        // 3. Guest check on private author (no viewerId) -> canView: false
-        mockMvc.perform(get("/api/v1/users/{id}/access-check", privateAuthor.getId()))
+    @Test
+    void testPendingAndSentFollowRequestsEndpoints() throws Exception {
+        MockMvc mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext).build();
+
+        UserResponse target = registerTestUser("targetuser", true);
+        UserResponse req1 = registerTestUser("reqone", false);
+        UserResponse req2 = registerTestUser("reqtwo", false);
+
+        // 1. Req1 and Req2 request to follow private target
+        userFollowService.followUser(req1.getId(), target.getId());
+        userFollowService.followUser(req2.getId(), target.getId());
+
+        // 2. Target checks pending incoming requests
+        UserContext.setUserId(target.getId());
+        mockMvc.perform(get("/api/v1/users/follows/pending"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.canView").value(false))
-                .andExpect(jsonPath("$.private").value(true));
+                .andExpect(jsonPath("$.totalElements").value(2));
 
-        // 4. Follow and accept -> canView: true
-        userFollowService.followUser(viewer.getId(), privateAuthor.getId());
-        userFollowService.respondToFollowRequest(privateAuthor.getId(), viewer.getId(), true);
-
-        mockMvc.perform(get("/api/v1/users/{id}/access-check", privateAuthor.getId())
-                        .param("viewerId", viewer.getId().toString()))
+        mockMvc.perform(get("/api/v1/users/me/follow-requests/pending"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.canView").value(true))
-                .andExpect(jsonPath("$.private").value(true))
-                .andExpect(jsonPath("$.following").value(true));
+                .andExpect(jsonPath("$.totalElements").value(2));
 
-        // 5. Self-view bypass -> canView: true
-        mockMvc.perform(get("/api/v1/users/{id}/access-check", privateAuthor.getId())
-                        .param("viewerId", privateAuthor.getId().toString()))
+        // Check Req1 sent requests
+        UserContext.setUserId(req1.getId());
+        mockMvc.perform(get("/api/v1/users/me/follow-requests/sent"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.canView").value(true));
+                .andExpect(jsonPath("$.totalElements").value(1));
+
+        mockMvc.perform(get("/api/v1/users/follows/sent"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(1));
+
+        // 3. Target accepts req1's request
+        UserContext.setUserId(target.getId());
+        userFollowService.respondToFollowRequest(target.getId(), req1.getId(), true);
+
+        // Target pending requests should now be 1 (only req2 left)
+        mockMvc.perform(get("/api/v1/users/follows/pending"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(1))
+                .andExpect(jsonPath("$.content[0].followerId").value(req2.getId().toString()));
+
+        // Req1 sent requests should now be 0 (no longer pending)
+        UserContext.setUserId(req1.getId());
+        mockMvc.perform(get("/api/v1/users/me/follow-requests/sent"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(0));
+    }
+
+    @Test
+    void testRemoveFollowerEndpoint() throws Exception {
+        MockMvc mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext).build();
+
+        UserResponse target = registerTestUser("target", false);
+        UserResponse follower = registerTestUser("follower", false);
+
+        // Follow target user (immediately accepted since target is public)
+        userFollowService.followUser(follower.getId(), target.getId());
+
+        // Verify follower is following target
+        Boolean isFollowingBefore = userGraphRedisService.isFollowing(follower.getId(), target.getId());
+        assertTrue(Boolean.TRUE.equals(isFollowingBefore));
+        assertTrue(userFollowRepository.findByIdFollowerIdAndIdFollowingId(follower.getId(), target.getId()).isPresent());
+
+        // Target removes follower using DELETE /api/v1/users/followers/{followerId}
+        UserContext.setUserId(target.getId());
+        mockMvc.perform(delete("/api/v1/users/followers/" + follower.getId()))
+                .andExpect(status().isNoContent());
+
+        // Verify relationship is deleted from Redis graph cache
+        Boolean isFollowingAfter = userGraphRedisService.isFollowing(follower.getId(), target.getId());
+        assertFalse(Boolean.TRUE.equals(isFollowingAfter));
+
+        // Verify relationship is deleted from PostgreSQL database
+        assertFalse(userFollowRepository.findByIdFollowerIdAndIdFollowingId(follower.getId(), target.getId()).isPresent());
+
+        // Test alias endpoint DELETE /api/v1/users/me/followers/{followerId}
+        userFollowService.followUser(follower.getId(), target.getId());
+        assertTrue(Boolean.TRUE.equals(userGraphRedisService.isFollowing(follower.getId(), target.getId())));
+
+        mockMvc.perform(delete("/api/v1/users/me/followers/" + follower.getId()))
+                .andExpect(status().isNoContent());
+
+        assertFalse(Boolean.TRUE.equals(userGraphRedisService.isFollowing(follower.getId(), target.getId())));
+        assertFalse(userFollowRepository.findByIdFollowerIdAndIdFollowingId(follower.getId(), target.getId()).isPresent());
     }
 
     @Test

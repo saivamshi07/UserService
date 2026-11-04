@@ -5,7 +5,7 @@
 - Database: PostgreSQL 17 (Relational core + JSONB attributes + `pg_trgm` GIN indexes for fuzzy search)
 - Caching & Sessions: Redis 7 (`spring-boot-starter-data-redis` + `StringRedisTemplate`)
 - Messaging: Apache Kafka (KRaft mode) + Transactional Outbox Pattern (`outbox_events` table + scheduled publisher)
-- Object Storage: S3 / MinIO via AWS SDK v2 (`software.amazon.awssdk:s3:2.29.50`)
+- Object Storage: S3 / MinIO / LocalStack via AWS SDK v2 (`software.amazon.awssdk:s3:2.29.50`)
 - Google Auth: Google API Client library (`com.google.api-client:google-api-client:2.7.0`)
 - Security: Spring Security Crypto (`BCryptPasswordEncoder`) + JJWT 0.12.6 + `JwtAuthenticationFilter`
 
@@ -47,8 +47,8 @@
     - `id` (UUID PK)
     - `aggregate_type` (VARCHAR 50, e.g. "USER")
     - `aggregate_id` (VARCHAR 100, user UUID)
-    - `event_type` (VARCHAR 100, e.g. "USER_REGISTERED", "USER_DEACTIVATED")
-    - `topic` (VARCHAR 100, e.g. "user.registered.v1", "user.deactivated.v1")
+    - `event_type` (VARCHAR 100, e.g. "USER_REGISTERED", "USER_DEACTIVATED", "PASSWORD_RESET_REQUESTED")
+    - `topic` (VARCHAR 100, e.g. "user.registered.v1", "user.deactivated.v1", "user.password-reset-requested.v1")
     - `payload` (TEXT / JSON)
     - `status` (ENUM: PENDING, PUBLISHED, FAILED)
     - `retry_count` (INT, default 0)
@@ -78,7 +78,15 @@
     - Token Rotation: Rotates refresh token on each `/refresh` call (old jti deleted, new jti persisted).
     - Immediate Revocation: On `/logout`, deletes `refresh_token:<jti>` from Redis.
     - Complete Account Revocation: On `deactivateUser()`, purges all active session keys across all user devices.
-- Passwords hashed using `BCryptPasswordEncoder`.
+    - Password Reset: Stores `password_reset:<token> -> userId` with 15-minute TTL; automatically consumed upon reset and triggers `revokeAllUserSessions(userId)`.
+    - Cooldown Anti-Bombing: Stores `password_reset_cooldown:user:<userId>` with 60-second TTL to throttle repetitive triggers against victim IDs.
+- **Production-Grade Password Reset & Victim Protection**:
+  - Passwords hashed using `BCryptPasswordEncoder`.
+  - **Zero Token Leakage in HTTP**: Forgot Password (`POST /api/v1/auth/forgot-password`) strictly returns generic anti-enumeration response (`{"message": "If an active account exists..."}`). `resetToken` is NEVER returned in the response body.
+  - **Transactional Outbox Delivery**: Reset token is persisted in PostgreSQL `outbox_events` and published to Kafka (`user.password-reset-requested.v1`) for out-of-band email/SMS delivery to the victim's verified address.
+  - **Victim Cooldown**: Redis cooldown (`password_reset_cooldown:user:{id}`) suppresses redundant tokens and spam when attackers flood forgot-password with a victim ID.
+  - **Reset Password Flow (`POST /api/v1/auth/reset-password`)**: Single-use token consumption, prevents previous password reuse, updates BCrypt hash, and instantly revokes all active refresh tokens across all devices via `revokeAllUserSessions(userId)`.
+  - **Authenticated Change Password (`PUT /api/v1/users/me/password`)**: Validates current password, prevents identical password re-use, and rotates sessions.
 - Google OAuth: Verifies Google ID tokens via `POST /api/v1/auth/google`, auto-provisions or links existing accounts.
 
 ## 6. S3 / MinIO Profile Picture Presigned URLs & Storage Lifecycle
@@ -100,6 +108,7 @@
 - **Events Published**:
   - `user.registered.v1`: Aggregate ID, username, email, phone, timestamp.
   - `user.deactivated.v1`: Aggregate ID, username, disabledAt timestamp.
+  - `user.password-reset-requested.v1`: Aggregate ID, username, email, resetToken, expiresAt, timestamp.
 - **Outbox Publisher Scheduler**:
   - `OutboxPublisherService` runs periodically (`@Scheduled(fixedDelayString = "${outbox.publisher.fixed-delay-ms:2000}")`).
   - Polls batches of `PENDING` events.
@@ -111,20 +120,27 @@
   - `postgres`: PostgreSQL 17-alpine with database healthcheck (`pg_isready`).
   - `redis`: Redis 7-alpine with ping healthcheck (Auth sessions & token revocation on port 6379).
   - `graph-redis`: Dedicated Redis 7-alpine container running on port 6380 for follower graphs and user privacy flags, isolated from auth session memory.
+  - `localstack`: LocalStack 4.4.0 (`localhost:4566`) emulating AWS S3 for local cloud development.
   - `minio`: MinIO object storage with automatic console on port 9001 and live healthcheck.
   - `create-buckets`: One-shot `minio/mc` container automatically creating `user-avatars` bucket with public read access.
   - `kafka`: Apache Kafka 3.8.0 in KRaft mode (no Zookeeper required) with broker API healthcheck.
 - 12-Factor externalized environment variable matrix configured in `application.properties`.
 
-## 9. Dedicated Social Graph Redis & Downstream Access APIs
+## 9. Dedicated Social Graph Redis & Social / Profile APIs
 - **Dedicated Graph Cache (`UserGraphRedisService`)**:
   - `graph:user:{userId}:following` -> Redis Set of target UUIDs the user follows. Contains `__EMPTY__` sentinel for users following 0 people to prevent cache penetration.
   - `graph:user:{userId}:privacy` -> Redis String (`PRIVATE` or `PUBLIC`).
-  - Updated atomically on `followUser` (accepted only), `unfollowUser`, `respondToFollowRequest`, `registerUser`, `updateUserProfile` (isPrivate toggle), and `deactivateUser` (eviction).
-- **APIs for Downstream Services (`movie-service`)**:
-  - `GET /api/v1/users/{authorId}/access-check?viewerId={viewerId}`: Instant single check evaluating `(!isPrivate || viewer == author || isFollowing)`.
+  - Updated atomically on `followUser` (accepted only), `unfollowUser`, `removeFollower`, `respondToFollowRequest`, `registerUser`, `updateUserProfile` (isPrivate toggle), and `deactivateUser` (eviction).
+- **Social Graph & Profile Endpoints**:
+  - `POST /api/v1/users/batch`: Batch fetch multiple user profiles by ID list (`ids: [...]`).
+  - `GET /api/v1/users/batch?ids=...`: Batch fetch multiple user profiles via query parameters.
+  - `DELETE /api/v1/users/followers/{followerId}` & `DELETE /api/v1/users/me/followers/{followerId}`: Allows an authenticated user to remove a follower from their followers list (`204 No Content`), evicting both PostgreSQL and Redis cache relations.
+  - `GET /api/v1/users/follows/pending` & `GET /api/v1/users/me/follow-requests/pending`: Paginated incoming pending follow requests awaiting approval.
+  - `GET /api/v1/users/me/follow-requests/sent` & `GET /api/v1/users/follows/sent`: Paginated outgoing follow requests sent by current user awaiting approval.
+  - `GET /api/v1/users/{id}/follow-status?viewerId={viewerId}`: Direct relationship check returning `isFollowing` boolean and `status` (`ACCEPTED`, `PENDING`, `null`).
+  - `GET /api/v1/users/{authorId}/access-check?viewerId={viewerId}`: Instant single check evaluating `(!isPrivate || viewer == author || isFollowing)` for review & rating visibility.
   - `POST /api/v1/users/access-context`: Batch resolution of multiple author privacy flags and viewer following sets in a single call, warming any missing Redis cache keys automatically.
 
 ## 10. Current Progress
-- All 23 unit & integration tests passing (`BUILD SUCCESS`).
-- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Dedicated Graph Redis, Access Check & Batch Context APIs, S3 Presigned URLs & Cleanup, Kafka Transactional Outbox, and externalized config bindings.
+- All 31 unit & integration tests passing (`BUILD SUCCESS`).
+- 100% test coverage over Registration, Trigram Search, Cookies/Auth lifecycle, Redis Session Revocation, Production Password Reset & Out-of-Band Outbox Dispatch, Dedicated Graph Redis, Access Check & Batch Context APIs, S3 Presigned URLs & Cleanup, Kafka Transactional Outbox, Follower Removal, Pending/Sent Requests, and externalized config bindings.

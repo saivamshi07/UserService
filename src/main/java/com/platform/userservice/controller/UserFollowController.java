@@ -4,6 +4,7 @@ import com.platform.userservice.context.UserContext;
 import com.platform.userservice.dto.BatchAccessContextRequest;
 import com.platform.userservice.dto.BatchAccessContextResponse;
 import com.platform.userservice.dto.FollowDecisionRequest;
+import com.platform.userservice.dto.FollowStatusResponse;
 import com.platform.userservice.dto.FollowUserRequest;
 import com.platform.userservice.dto.UserAccessCheckResponse;
 import com.platform.userservice.dto.UserFollowResponse;
@@ -71,6 +72,16 @@ public class UserFollowController {
     }
 
     /**
+     * Remove a follower from the current user's followers list.
+     */
+    @DeleteMapping(value = {"/followers/{followerId}", "/me/followers/{followerId}"})
+    public ResponseEntity<Void> removeFollower(@PathVariable("followerId") UUID followerId) {
+        UUID currentUserId = UserContext.getRequiredUserId();
+        userFollowService.removeFollower(currentUserId, followerId);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
      * Respond to a pending follow request (accept or reject) using a JSON body.
      */
     @PostMapping("/follows/respond")
@@ -81,6 +92,26 @@ public class UserFollowController {
                 request.getFollowerId(),
                 request.getAccept()
         ));
+    }
+
+    /**
+     * Paginated list of incoming pending follow requests waiting for approval by current user.
+     */
+    @GetMapping(value = {"/follows/pending", "/me/follow-requests/pending"})
+    public ResponseEntity<Page<UserFollowResponse>> getPendingFollowRequests(
+            @PageableDefault(size = 20) Pageable pageable) {
+        UUID currentUserId = UserContext.getRequiredUserId();
+        return ResponseEntity.ok(userFollowService.getPendingFollowRequests(currentUserId, pageable));
+    }
+
+    /**
+     * Paginated list of outgoing follow requests sent by current user awaiting approval.
+     */
+    @GetMapping(value = {"/me/follow-requests/sent", "/follows/sent"})
+    public ResponseEntity<Page<UserFollowResponse>> getSentFollowRequests(
+            @PageableDefault(size = 20) Pageable pageable) {
+        UUID currentUserId = UserContext.getRequiredUserId();
+        return ResponseEntity.ok(userFollowService.getSentFollowRequests(currentUserId, pageable));
     }
 
     /**
@@ -101,6 +132,17 @@ public class UserFollowController {
             @PathVariable("id") UUID userId,
             @PageableDefault(size = 20) Pageable pageable) {
         return ResponseEntity.ok(userFollowService.getFollowing(userId, pageable));
+    }
+
+    /**
+     * Direct relationship status check: checks if current user (or optional viewerId) is following target user.
+     */
+    @GetMapping("/{id}/follow-status")
+    public ResponseEntity<FollowStatusResponse> getFollowStatus(
+            @PathVariable("id") UUID targetUserId,
+            @RequestParam(name = "viewerId", required = false) UUID viewerId) {
+        UUID effectiveViewerId = viewerId != null ? viewerId : UserContext.getRequiredUserId();
+        return ResponseEntity.ok(userFollowService.getFollowStatus(effectiveViewerId, targetUserId));
     }
 
     /**

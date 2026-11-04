@@ -45,6 +45,25 @@ services:
       timeout: 3s
       retries: 5
 
+  localstack:
+    image: localstack/localstack:4.4.0
+    container_name: user-service-localstack
+    restart: always
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./docker/localstack-init:/etc/localstack/init/ready.d
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   minio:
     image: minio/minio:latest
     container_name: user-service-minio
@@ -109,5 +128,6 @@ volumes:
   postgres_data:
   redis_data:
   graph_redis_data:
+  localstack_data:
   minio_data:
   kafka_data:

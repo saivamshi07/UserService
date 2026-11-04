@@ -8,7 +8,7 @@
 [![AWS SDK v2 / MinIO](https://img.shields.io/badge/Storage-S3%20%2F%20MinIO-yellow.svg)](https://min.io/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-An enterprise-grade, event-driven **User & Identity Microservice** built with **Spring Boot**, **PostgreSQL 17**, **Redis 7**, **MinIO/S3**, and **Apache Kafka**.
+An enterprise-grade, event-driven **User & Identity Microservice** built with **Spring Boot**, **PostgreSQL 17**, **Redis 7**, **MinIO/LocalStack/S3**, and **Apache Kafka**.
 
 Designed with strict zero-trust security, dual-write consistency via the **Transactional Outbox Pattern**, fuzzy trigram full-text search, direct-to-cloud presigned avatar uploads, dynamic policy enforcement, and a **dedicated Social Graph Redis cache** for high-performance downstream authorization (e.g. `movie-service`).
 
@@ -20,9 +20,10 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 - [Tech Stack](#-tech-stack)
 - [System Workflows](#-system-workflows)
   - [1. Authentication & Redis Session Lifecycle](#1-authentication--redis-session-lifecycle)
-  - [2. Dedicated Social Graph Cache & Downstream Access Checks](#2-dedicated-social-graph-cache--downstream-access-checks)
-  - [3. Direct S3/MinIO Avatar Upload Flow](#3-direct-s3minio-avatar-upload-flow)
-  - [4. Transactional Outbox Domain Event Publishing](#4-transactional-outbox-domain-event-publishing)
+  - [2. Password Reset & Out-of-Band Delivery Flow](#2-password-reset--out-of-band-delivery-flow)
+  - [3. Dedicated Social Graph Cache & Downstream Access Checks](#3-dedicated-social-graph-cache--downstream-access-checks)
+  - [4. Direct S3/MinIO Avatar Upload Flow](#4-direct-s3minio-avatar-upload-flow)
+  - [5. Transactional Outbox Domain Event Publishing](#5-transactional-outbox-domain-event-publishing)
 - [Database Schema & Search Indexing](#-database-schema--search-indexing)
 - [Configuration & Policy Engine](#-configuration--policy-engine)
 - [Environment Variables (Production Deployment)](#-environment-variables-production-deployment)
@@ -56,7 +57,8 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 │• users    │     │:6379      │            │           │            │           │
 │• outbox   │     └───────────┘            │•registered│            │• following│
 │• follows  │                              │•deactivate│            │• privacy  │
-└───────────┘                              └───────────┘            └───────────┘
+└───────────┘                              │•pwd-reset │            └───────────┘
+                                           └───────────┘
 ```
 
 ---
@@ -69,27 +71,33 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
   - **Refresh Token**: Long-lived (7 days) with unique UUID JWT ID (`jti`) persisted in Redis.
 - **Cookie Security**: Tokens delivered via `HttpOnly`, `SameSite=Strict`, `Secure` cookies with automatic fallback to `Authorization: Bearer <token>` headers for mobile clients.
 - **Token Rotation & Instant Revocation**: Every refresh request rotates the token and invalidates the previous `jti`. User logout or account deactivation instantly purges session keys across all user devices.
+- **Production-Grade Password Reset & Victim Protection**:
+  - **Zero HTTP Token Leakage**: The HTTP response never returns `resetToken`, returning only a generic anti-enumeration response (`{"message": "If an active account exists..."}`).
+  - **Transactional Outbox Event Dispatch**: Emits `user.password-reset-requested.v1` atomically in PostgreSQL for asynchronous out-of-band delivery (email/SMS) to the legitimate user.
+  - **Anti-Bombing Cooldown**: Per-user Redis cooldown prevents attackers from flooding a victim's mailbox with repeated triggers.
+  - **Session Invalidation**: Completing a reset revokes all active refresh tokens across all devices and validates against identical previous password reuse.
+  - **Authenticated Change Password**: `PUT /api/v1/users/me/password` verifies the current password and revokes all other active sessions.
 - **Anti-Spoofing Context**: `JwtAuthenticationFilter` validates caller identity and enforces trusted boundary verification before population of the thread-local `UserContext`.
 - **Google OAuth Integration**: Native Google ID Token verification (`com.google.api-client`), auto-provisioning new accounts or linking existing email identities.
 
 ### 👥 Dedicated Social Graph Redis & Downstream Authorization
 - **Isolated Graph Cache**: Dedicated Redis container on port `6380` isolated from auth sessions, eliminating blast radius and session eviction risks.
-- **Real-Time Consistency**: Follow, unfollow, accept/reject, registration, and privacy toggles update the graph cache synchronously.
+- **Real-Time Consistency**: Follow, unfollow, follower removal, accept/reject, registration, and privacy toggles update the graph cache synchronously.
 - **Anti-Penetration Sentinel**: Users following 0 people store an `__EMPTY__` sentinel to prevent cache misses on empty sets.
-- **Downstream Batched APIs**: Downstream services (e.g. `movie-service`) can fetch viewer followings and multiple author privacy flags via `POST /api/v1/users/access-context` with automatic DB-to-Redis cache warming.
+- **Downstream Batched APIs & Review Privacy Access**: Downstream services (e.g. `movie-service`) can fetch viewer followings and multiple author privacy flags via `POST /api/v1/users/access-context` with automatic DB-to-Redis cache warming. Single-check endpoint `GET /api/v1/users/{id}/access-check` evaluates author privacy vs. viewer follow status for fine-grained review & ratings visibility.
 
 ### 🔍 PostgreSQL Trigram Fuzzy Search (`pg_trgm`)
 - Native inverted **GIN trigram indexes** (`idx_users_username_trgm`, `idx_users_bio_trgm`) provisioned on startup via `DatabaseInitializer`.
 - Typo-tolerant substring and similarity search scoring (`similarity(username, :q) > 0.2`) with exact prefix boosting.
 
-### 🖼️ S3 / MinIO Profile Picture Presigned URLs
-- **Direct-to-Cloud Uploads**: Backed by AWS SDK v2 (`S3Presigner`), clients upload large binaries directly to MinIO/S3 via SigV4 presigned PUT URLs, offloading network I/O from the app.
+### 🖼️ S3 / MinIO / LocalStack Profile Picture Presigned URLs
+- **Direct-to-Cloud Uploads**: Backed by AWS SDK v2 (`S3Presigner`), clients upload large binaries directly to MinIO, LocalStack, or AWS S3 via SigV4 presigned PUT URLs, offloading network I/O from the app.
 - **Policy Enforcement**: Pre-validates file sizes (max 5 MB) and MIME types (`image/jpeg`, `image/png`, `image/webp`).
 - **Orphan Cleanup**: Updating a profile photo automatically triggers an asynchronous background deletion of the previous avatar object in S3/MinIO.
 
 ### 📬 Transactional Outbox Pattern (Apache Kafka)
 - Prevents dual-write bugs and phantom events.
-- Domain events (`user.registered.v1`, `user.deactivated.v1`) are written atomically to the `outbox_events` table inside the exact same database transaction as business logic.
+- Domain events (`user.registered.v1`, `user.deactivated.v1`, `user.password-reset-requested.v1`) are written atomically to the `outbox_events` table inside the exact same database transaction as business logic.
 - Background scheduled poller (`OutboxPublisherService`) batches pending events, publishes them to Kafka with retry counters, and marks records `PUBLISHED` upon delivery confirmation.
 
 ---
@@ -104,7 +112,7 @@ Designed with strict zero-trust security, dual-write consistency via the **Trans
 | **Auth Caching & Sessions** | Redis | 7 (Alpine, Port 6379) |
 | **Social Graph Cache** | Redis | 7 (Alpine, Port 6380) |
 | **Event Streaming** | Apache Kafka (KRaft mode) | 3.8.0 |
-| **Object Storage** | MinIO / AWS S3 (AWS SDK v2) | 2.29.50 |
+| **Object Storage** | MinIO / LocalStack / AWS S3 (AWS SDK v2) | 2.29.50 |
 | **Security & JWT** | JJWT (io.jsonwebtoken) | 0.12.6 |
 | **Password Hashing** | Spring Security Crypto (BCrypt) | Latest |
 | **OAuth** | Google API Client | 2.7.0 |
@@ -140,164 +148,6 @@ sequenceDiagram
     Auth->>Redis: DEL refresh_token:{old_jti} (Rotation)
     Auth->>Redis: Save refresh_token:{new_jti} -> userId
     Auth-->>Client: Set updated access_token & refresh_token Cookies
-```
-
----
-
-### 2. Dedicated Social Graph Cache & Downstream Access Checks
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client
-    participant Downstream as movie-service
-    participant GraphRedis as Graph Redis (:6380)
-    participant UserCtrl as UserFollowController
-    participant DB as PostgreSQL
-
-    Note over Client,Downstream: Movie Reviews Feed Request
-    Client->>Downstream: GET /api/v1/movies/123/reviews (viewerId)
-    Downstream->>GraphRedis: MGET graph:user:{authorId}:privacy & SMEMBERS graph:user:{viewerId}:following
-    
-    alt Cache Miss in Graph Redis
-        Downstream->>UserCtrl: POST /api/v1/users/access-context (viewerId, authorIds)
-        UserCtrl->>DB: Fetch missing privacy flags & following links
-        UserCtrl->>GraphRedis: Warm missing keys (MSET privacy, SADD following)
-        UserCtrl-->>Downstream: 200 OK (BatchAccessContextResponse)
-    else Cache Hit
-        GraphRedis-->>Downstream: Privacy flags & Following set (< 1ms)
-    end
-
-    Note over Downstream: Filter: If private & author != viewer & not followed -> hide
-    Downstream-->>Client: Return Filtered Reviews
-```
-
----
-
-### 3. Direct S3/MinIO Avatar Upload Flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client
-    participant UserCtrl as UserController
-    participant AvatarSvc as AvatarStorageService
-    participant S3 as S3 / MinIO Storage
-    participant DB as PostgreSQL
-
-    Client->>UserCtrl: POST /api/v1/users/me/avatar/presigned-url (contentType, fileSize)
-    UserCtrl->>AvatarSvc: Validate file policy (<=5MB, PNG/JPEG/WEBP)
-    AvatarSvc->>S3: Generate SigV4 Presigned PUT URL (Key: avatars/{userId}/{uuid}.png)
-    AvatarSvc-->>Client: Returns { uploadUrl, fileUrl, s3Key, expiresAt }
-    
-    Client->>S3: PUT [Binary Payload] directly to uploadUrl
-    S3-->>Client: 200 OK
-    
-    Client->>UserCtrl: PUT /api/v1/users/me (pictureUrl: fileUrl)
-    UserCtrl->>AvatarSvc: Delete old avatar from S3 (avatars/{userId}/old.png)
-    AvatarSvc->>S3: DeleteObjectRequest
-    UserCtrl->>DB: UPDATE users SET picture_url = :fileUrl
-    DB-->>Client: Updated Profile Response
-```
-
----
-
-### 4. Transactional Outbox Domain Event Publishing
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client
-    participant UserSvc as UserService
-    participant OutboxSvc as OutboxService
-    participant DB as PostgreSQL
-    participant Poller as OutboxPublisherService
-    participant Kafka as Apache Kafka
-
-    Client->>UserSvc: POST /api/v1/auth/register (payload)
-    rect rgb(240, 248, 255)
-        Note over UserSvc,DB: Atomic Database Transaction
-        UserSvc->>DB: INSERT INTO users (...)
-        UserSvc->>OutboxSvc: saveEvent(aggregateId, "USER_REGISTERED", payload)
-        OutboxSvc->>DB: INSERT INTO outbox_events (status="PENDING", ...)
-        DB-->>UserSvc: Transaction Committed Atomically
-    end
-    UserSvc-->>Client: 201 Created
-
-    loop Every 2000ms (@Scheduled)
-        Poller->>DB: SELECT * FROM outbox_events WHERE status='PENDING' ORDER BY created_at LIMIT 50
-        DB-->>Poller: Batch of Outbox Events
-        Poller->>Kafka: send(topic, aggregateId, payload)
-        Kafka-->>Poller: Delivery Acknowledgment
-        Poller->>DB: UPDATE outbox_events SET status='PUBLISHED', processed_at=NOW()
-    end
-```
-
----
-
-## 💾 Database Schema & Search Indexing
-
-### PostgreSQL Tables
-
-#### 1. `users` Table
-```sql
-CREATE TABLE users (
-    id UUID PRIMARY KEY,
-    username VARCHAR(50) NOT NULL UNIQUE,
-    email VARCHAR(100) UNIQUE,
-    phone VARCHAR(20) UNIQUE,
-    password_hash VARCHAR(255),
-    bio VARCHAR(160),
-    picture_url VARCHAR(500),
-    public_profiles JSONB,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    is_private BOOLEAN NOT NULL DEFAULT FALSE,
-    is_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
-    is_phone_verified BOOLEAN NOT NULL DEFAULT FALSE,
-    is_email_private BOOLEAN NOT NULL DEFAULT FALSE,
-    is_phone_private BOOLEAN NOT NULL DEFAULT FALSE,
-    is_picture_private BOOLEAN NOT NULL DEFAULT FALSE,
-    disabled_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL
-);
-
--- Trigram GIN indexes for typo-tolerant fuzzy matching
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE INDEX idx_users_username_trgm ON users USING gin (username gin_trgm_ops);
-CREATE INDEX idx_users_bio_trgm ON users USING gin (bio gin_trgm_ops);
-```
-
-#### 2. `user_follows` Table
-```sql
-CREATE TABLE user_follows (
-    follower_id UUID NOT NULL,
-    following_id UUID NOT NULL,
-    status VARCHAR(20) NOT NULL, -- ACCEPTED, PENDING, REJECTED
-    created_at TIMESTAMP NOT NULL,
-    PRIMARY KEY (follower_id, following_id),
-    CONSTRAINT fk_follower FOREIGN KEY (follower_id) REFERENCES users(id) ON DELETE CASCADE,
-    CONSTRAINT fk_following FOREIGN KEY (following_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_user_follows_following_status ON user_follows(following_id, status);
-```
-
-#### 3. `outbox_events` Table
-```sql
-CREATE TABLE outbox_events (
-    id UUID PRIMARY KEY,
-    aggregate_type VARCHAR(50) NOT NULL,
-    aggregate_id VARCHAR(100) NOT NULL,
-    event_type VARCHAR(100) NOT NULL,
-    topic VARCHAR(100) NOT NULL,
-    payload TEXT NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-    retry_count INT NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TIMESTAMP NOT NULL,
-    processed_at TIMESTAMP
-);
-CREATE INDEX idx_outbox_events_status_created ON outbox_events(status, created_at);
 ```
 
 ---
@@ -350,12 +200,12 @@ The service follows the **12-Factor App methodology**. Every configuration param
 | `JWT_SECRET` | HMAC-SHA256 signature key | *(32+ char key)* | 256-bit cryptographically random secret |
 | `JWT_COOKIE_SECURE` | Enable `Secure` cookie flag | `false` | **`true`** (Strictly required for HTTPS) |
 | `GATEWAY_SHARED_SECRET` | Secret for `X-Gateway-Secret` | `local-dev-gateway-secret` | High-entropy gateway token |
-| `S3_ENDPOINT` | MinIO or AWS S3 endpoint | `http://localhost:9000` | Empty or `https://s3.us-east-1.amazonaws.com` |
+| `S3_ENDPOINT` | MinIO or AWS S3 / LocalStack endpoint | `http://localhost:9000` | Empty or `https://s3.us-east-1.amazonaws.com` |
 | `S3_REGION` | S3 AWS region | `us-east-1` | Target AWS region |
 | `S3_BUCKET_NAME` | S3 bucket for avatars | `user-avatars` | Production S3 bucket name |
 | `S3_ACCESS_KEY` | S3 Access Key ID | `minioadmin` | AWS IAM role / access key |
 | `S3_SECRET_KEY` | S3 Secret Access Key | `minioadmin` | AWS IAM secret access key |
-| `S3_PATH_STYLE_ACCESS` | Use path-style S3 URLs | `true` (MinIO) | `false` (AWS S3 virtual hosted style) |
+| `S3_PATH_STYLE_ACCESS` | Use path-style S3 URLs | `true` (MinIO/LocalStack) | `false` (AWS S3 virtual hosted style) |
 | `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address list | `localhost:9092` | Managed Kafka (e.g. AWS MSK, Confluent) |
 
 ---
@@ -371,14 +221,19 @@ The service follows the **12-Factor App methodology**. Every configuration param
 | `POST` | `/api/v1/auth/google` | Sign in or auto-provision with Google ID Token | No |
 | `POST` | `/api/v1/auth/refresh` | Rotate session tokens using refresh cookie | Yes (Cookie) |
 | `POST` | `/api/v1/auth/logout` | Revoke session and clear cookies | Yes (Cookie) |
+| `POST` | `/api/v1/auth/forgot-password` | Request password reset (anti-enumeration, out-of-band delivery) | No |
+| `POST` | `/api/v1/auth/reset-password` | Reset password using one-time token | No |
 
-#### Register Request Body:
+#### Forgot Password Request:
 ```json
+// POST /api/v1/auth/forgot-password
 {
-  "username": "johndoe",
-  "email": "john@example.com",
-  "phone": "+1234567890",
-  "password": "SecurePassword123!"
+  \"identifier\": \"john@example.com\"
+}
+
+// Response (Status: 200 OK - Token NEVER returned in HTTP body)
+{
+  \"message\": \"If an active account exists with that identifier, instructions to reset your password have been sent.\"
 }
 ```
 
@@ -390,25 +245,22 @@ The service follows the **12-Factor App methodology**. Every configuration param
 | :--- | :--- | :--- | :---: |
 | `GET` | `/api/v1/users/{id}` | Get user profile by UUID | Optional |
 | `GET` | `/api/v1/users/by-username/{username}` | Get user profile by username | Optional |
+| `POST` | `/api/v1/users/batch` | Batch fetch multiple user profiles by ID list (request body) | Optional |
+| `GET` | `/api/v1/users/batch?ids=...` | Batch fetch multiple user profiles by query params (`ids=id1,id2`) | Optional |
 | `PUT` | `/api/v1/users/me` | Update authenticated user's profile | **Yes** |
+| `PUT` | `/api/v1/users/me/password` | Change password with current password verification | **Yes** |
 | `POST` | `/api/v1/users/me/avatar/presigned-url` | Generate S3 presigned upload URL | **Yes** |
 | `DELETE` | `/api/v1/users/me` | Deactivate account and revoke all sessions | **Yes** |
 | `GET` | `/api/v1/users/search?q={query}` | Typo-tolerant trigram search | No |
 
-#### Requesting Avatar Presigned Upload URL:
+#### Batch Users Request:
 ```json
-// POST /api/v1/users/me/avatar/presigned-url
+// POST /api/v1/users/batch
 {
-  "contentType": "image/png",
-  "fileSizeBytes": 1048576
-}
-
-// Response
-{
-  "uploadUrl": "http://localhost:9000/user-avatars/avatars/user-id/uuid.png?X-Amz-...",
-  "fileUrl": "http://localhost:9000/user-avatars/avatars/user-id/uuid.png",
-  "s3Key": "avatars/user-id/uuid.png",
-  "expiresAt": "2026-10-08T10:15:00Z"
+  \"ids\": [
+    \"a1111111-0000-0000-0000-000000000000\",
+    \"b2222222-0000-0000-0000-000000000000\"
+  ]
 }
 ```
 
@@ -418,22 +270,43 @@ The service follows the **12-Factor App methodology**. Every configuration param
 
 | Method | Endpoint | Description | Auth Required |
 | :--- | :--- | :--- | :---: |
-| `POST` | `/api/v1/users/follows` | Follow a user (body: `{ "targetUserId": "..." }`) | **Yes** |
+| `POST` | `/api/v1/users/follows` | Follow a user (body: `{ \"targetUserId\": \"...\" }`) | **Yes** |
+| `POST` | `/api/v1/users/{id}/follow` | Follow a user via path parameter | **Yes** |
 | `DELETE` | `/api/v1/users/follows/{targetUserId}` | Unfollow a user | **Yes** |
+| `DELETE` | `/api/v1/users/{id}/unfollow` | Unfollow a user via path parameter | **Yes** |
+| `DELETE` | `/api/v1/users/followers/{followerId}` | Remove a follower from current user's followers list | **Yes** |
+| `DELETE` | `/api/v1/users/me/followers/{followerId}` | *(Alias)* Remove a follower from current user's followers list | **Yes** |
 | `POST` | `/api/v1/users/follows/respond` | Accept/Reject follow request | **Yes** |
+| `GET` | `/api/v1/users/follows/pending` | List incoming pending follow requests awaiting approval | **Yes** |
+| `GET` | `/api/v1/users/me/follow-requests/pending` | *(Alias)* List incoming pending follow requests | **Yes** |
+| `GET` | `/api/v1/users/me/follow-requests/sent` | List outgoing follow requests sent by current user awaiting approval | **Yes** |
+| `GET` | `/api/v1/users/follows/sent` | *(Alias)* List outgoing follow requests sent by current user | **Yes** |
 | `GET` | `/api/v1/users/{id}/followers` | List paginated followers of a user | No |
 | `GET` | `/api/v1/users/{id}/following` | List paginated users followed by user | No |
-| `GET` | `/api/v1/users/{id}/access-check?viewerId={viewerId}` | Single check if viewer can see private author content | No |
+| `GET` | `/api/v1/users/{id}/follow-status?viewerId={viewerId}` | Direct relationship status check (`isFollowing`, `status`) | Optional |
+| `GET` | `/api/v1/users/{id}/access-check?viewerId={viewerId}` | Single check if viewer can see private author content (reviews/ratings) | Optional |
 | `POST` | `/api/v1/users/access-context` | Batch fetch author privacy & viewer followings (with cache warming) | No |
+
+#### Check Follow Status:
+```json
+// GET /api/v1/users/{targetUserId}/follow-status
+// Response:
+{
+  \"currentUserId\": \"11111111-0000-0000-0000-000000000000\",
+  \"targetUserId\": \"22222222-0000-0000-0000-000000000000\",
+  \"isFollowing\": true,
+  \"status\": \"ACCEPTED\"
+}
+```
 
 #### Batch Access Context Request (`POST /api/v1/users/access-context`):
 Used by downstream services (like `movie-service`) when rendering paginated review feeds:
 ```json
 {
-  "viewerId": "b1a2c3d4-0000-0000-0000-000000000000",
-  "authorIds": [
-    "a1111111-0000-0000-0000-000000000000",
-    "a2222222-0000-0000-0000-000000000000"
+  \"viewerId\": \"b1a2c3d4-0000-0000-0000-000000000000\",
+  \"authorIds\": [
+    \"a1111111-0000-0000-0000-000000000000\",
+    \"a2222222-0000-0000-0000-000000000000\"
   ]
 }
 ```
@@ -441,13 +314,13 @@ Used by downstream services (like `movie-service`) when rendering paginated revi
 #### Response:
 ```json
 {
-  "viewerId": "b1a2c3d4-0000-0000-0000-000000000000",
-  "viewerFollowing": [
-    "a2222222-0000-0000-0000-000000000000"
+  \"viewerId\": \"b1a2c3d4-0000-0000-0000-000000000000\",
+  \"viewerFollowing\": [
+    \"a2222222-0000-0000-0000-000000000000\"
   ],
-  "authorPrivacy": {
-    "a1111111-0000-0000-0000-000000000000": false,
-    "a2222222-0000-0000-0000-000000000000": true
+  \"authorPrivacy\": {
+    \"a1111111-0000-0000-0000-000000000000\": false,
+    \"a2222222-0000-0000-0000-000000000000\": true
   }
 }
 ```
@@ -466,6 +339,7 @@ docker compose up -d
 - **PostgreSQL 17** (`localhost:5432`): Database `userServiceDB`, User `postgres`, Password `password`.
 - **Redis 7 (Auth & Sessions)** (`localhost:6379`): Session storage and token revocation engine.
 - **Redis 7 (Social Graph)** (`localhost:6380`): Dedicated follower graph and privacy status cache.
+- **LocalStack 4.4.0** (`localhost:4566`): Fully functional AWS S3 emulation for local cloud testing.
 - **MinIO S3** (`localhost:9000`, Web UI Console: `http://localhost:9001`): User `minioadmin`, Password `minioadmin`.
 - **MinIO Bucket Auto-Init (`create-buckets`)**: Automatically provisions `user-avatars` bucket with public read access.
 - **Apache Kafka 3.8.0** (`localhost:9092`): Running in modern KRaft mode (ZooKeeper-less).
@@ -505,8 +379,9 @@ The project includes unit, repository, and end-to-end integration tests using Mo
 ./mvnw clean test
 ```
 
-### Coverage Highlights (All 23 Tests Passing):
-- **`UserAccessIntegrationTest`**: Dedicated Graph Redis real-time sync on follow/unfollow/approval, single access check evaluation, and batch access context with automatic cache warming.
+### Coverage Highlights (All 31 Tests Passing):
+- **`PasswordResetIntegrationTest`**: Verifies zero HTTP token leakage, Transactional Outbox event dispatching, victim-ID targeting resistance, spam cooldown, cross-device multi-session revocation, and password anti-reuse enforcement.
+- **`UserAccessIntegrationTest`**: Dedicated Graph Redis real-time sync on follow/unfollow/approval/follower removal, single access check evaluation, direct follow relationship status, pending & sent follow request listings, and batch access context with automatic cache warming.
 - **`AuthControllerIntegrationTest`**: Complete cookie authentication lifecycle, token rotation, and Redis instant revocation.
 - **`UserSecurityIntegrationTest`**: Strict header anti-spoofing tests, bearer token parsing, and user context isolation.
 - **`UserSearchIntegrationTest`**: Fuzzy trigram similarity search queries and username collision checks.

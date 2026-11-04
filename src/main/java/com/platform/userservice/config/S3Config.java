@@ -15,16 +15,16 @@ import java.net.URI;
 @Configuration
 public class S3Config {
 
-    @Value("${storage.s3.endpoint:http://localhost:9000}")
+    @Value("${storage.s3.endpoint:http://localhost:4566}")
     private String endpoint;
 
     @Value("${storage.s3.region:us-east-1}")
     private String region;
 
-    @Value("${storage.s3.access-key:minioadmin}")
+    @Value("${storage.s3.access-key:test}")
     private String accessKey;
 
-    @Value("${storage.s3.secret-key:minioadmin}")
+    @Value("${storage.s3.secret-key:test}")
     private String secretKey;
 
     @Bean

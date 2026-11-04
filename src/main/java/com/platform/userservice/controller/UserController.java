@@ -3,6 +3,8 @@ package com.platform.userservice.controller;
 import com.platform.userservice.context.UserContext;
 import com.platform.userservice.dto.AvatarPresignedUrlRequest;
 import com.platform.userservice.dto.AvatarPresignedUrlResponse;
+import com.platform.userservice.dto.BatchUsersRequest;
+import com.platform.userservice.dto.ChangePasswordRequest;
 import com.platform.userservice.dto.UpdateUserRequest;
 import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.dto.UserSearchResponse;
@@ -25,6 +27,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @RestController
@@ -41,6 +45,30 @@ public class UserController {
         return ResponseEntity.ok(userService.getUserById(id, currentUserId));
     }
 
+    /**
+     * Batch fetch multiple users by IDs via JSON request body.
+     */
+    @PostMapping("/batch")
+    public ResponseEntity<List<UserResponse>> getUsersByIdsBatch(@Valid @RequestBody BatchUsersRequest request) {
+        UUID currentUserId = UserContext.getUserId();
+        return ResponseEntity.ok(userService.getUsersByIds(request.getIds(), currentUserId));
+    }
+
+    /**
+     * Batch fetch multiple users by query parameters: /api/v1/users/batch?ids=... or /api/v1/users?ids=...
+     */
+    @GetMapping(value = {"/batch"}, params = "ids")
+    public ResponseEntity<List<UserResponse>> getUsersByIdsQuery(@RequestParam("ids") List<UUID> ids) {
+        UUID currentUserId = UserContext.getUserId();
+        return ResponseEntity.ok(userService.getUsersByIds(ids, currentUserId));
+    }
+
+    @GetMapping(params = "ids")
+    public ResponseEntity<List<UserResponse>> getUsersByIdsParam(@RequestParam("ids") List<UUID> ids) {
+        UUID currentUserId = UserContext.getUserId();
+        return ResponseEntity.ok(userService.getUsersByIds(ids, currentUserId));
+    }
+
     @GetMapping("/by-username/{username}")
     public ResponseEntity<UserResponse> getUserByUsername(@PathVariable("username") String username) {
         UUID currentUserId = UserContext.getUserId();
@@ -51,6 +79,20 @@ public class UserController {
     public ResponseEntity<UserResponse> updateProfile(@Valid @RequestBody UpdateUserRequest request) {
         UUID currentUserId = UserContext.getRequiredUserId();
         return ResponseEntity.ok(userService.updateUserProfile(currentUserId, request));
+    }
+
+    @PutMapping("/me/password")
+    public ResponseEntity<Map<String, String>> changePassword(
+            @Valid @RequestBody ChangePasswordRequest request,
+            HttpServletRequest httpRequest) {
+        UUID currentUserId = UserContext.getRequiredUserId();
+        String clientIp = httpRequest.getRemoteAddr();
+        String userAgent = httpRequest.getHeader("User-Agent");
+
+        userService.changePassword(currentUserId, request, clientIp, userAgent);
+        return ResponseEntity.ok(Map.of(
+                "message", "Password has been successfully changed."
+        ));
     }
 
     @PostMapping("/me/avatar/presigned-url")

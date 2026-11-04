@@ -1,8 +1,11 @@
 package com.platform.userservice.controller;
 
+import com.platform.userservice.dto.ForgotPasswordRequest;
+import com.platform.userservice.dto.ForgotPasswordResponse;
 import com.platform.userservice.dto.GoogleAuthRequest;
 import com.platform.userservice.dto.LoginRequest;
 import com.platform.userservice.dto.RegisterRequest;
+import com.platform.userservice.dto.ResetPasswordRequest;
 import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.entity.User;
 import com.platform.userservice.exception.InvalidTokenException;
@@ -26,6 +29,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
 
 @RestController
@@ -116,6 +120,30 @@ public class AuthController {
                 .header(HttpHeaders.SET_COOKIE, clearAccess.toString())
                 .header(HttpHeaders.SET_COOKIE, clearRefresh.toString())
                 .build();
+    }
+
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ForgotPasswordResponse> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request,
+            HttpServletRequest httpRequest) {
+        String clientIp = extractClientIp(httpRequest);
+        String userAgent = httpRequest.getHeader("User-Agent");
+
+        ForgotPasswordResponse response = userService.requestPasswordReset(request, clientIp, userAgent);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/reset-password")
+    public ResponseEntity<Map<String, String>> resetPassword(
+            @Valid @RequestBody ResetPasswordRequest request,
+            HttpServletRequest httpRequest) {
+        String clientIp = extractClientIp(httpRequest);
+        String userAgent = httpRequest.getHeader("User-Agent");
+
+        userService.resetPassword(request, clientIp, userAgent);
+        return ResponseEntity.ok(Map.of(
+                "message", "Password has been successfully reset. Please log in with your new password."
+        ));
     }
 
     private ResponseEntity<UserResponse> buildAuthResponse(UserResponse userResponse, HttpStatus status) {

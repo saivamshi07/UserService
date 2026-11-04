@@ -1,17 +1,23 @@
 package com.platform.userservice.service;
 
+import com.platform.userservice.dto.ChangePasswordRequest;
+import com.platform.userservice.dto.ForgotPasswordRequest;
+import com.platform.userservice.dto.ForgotPasswordResponse;
 import com.platform.userservice.dto.LoginRequest;
 import com.platform.userservice.dto.RegisterRequest;
+import com.platform.userservice.dto.ResetPasswordRequest;
 import com.platform.userservice.dto.UpdateUserRequest;
 import com.platform.userservice.dto.UserResponse;
 import com.platform.userservice.dto.UserSearchResponse;
 import com.platform.userservice.entity.FollowStatus;
 import com.platform.userservice.entity.User;
 import com.platform.userservice.entity.UserAuditLog;
+import com.platform.userservice.event.PasswordResetRequestedEvent;
 import com.platform.userservice.event.UserDeactivatedEvent;
 import com.platform.userservice.event.UserRegisteredEvent;
 import com.platform.userservice.exception.DuplicateResourceException;
 import com.platform.userservice.exception.InvalidTokenException;
+import com.platform.userservice.exception.PolicyViolationException;
 import com.platform.userservice.exception.ResourceNotFoundException;
 import com.platform.userservice.repository.UserAuditLogRepository;
 import com.platform.userservice.repository.UserFollowRepository;
@@ -26,7 +32,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -52,6 +60,9 @@ public class UserService {
 
     @Value("${kafka.topics.user-deactivated:user.deactivated.v1}")
     private String userDeactivatedTopic;
+
+    @Value("${kafka.topics.password-reset-requested:user.password-reset-requested.v1}")
+    private String passwordResetTopic;
 
     @Transactional
     public UserResponse registerUser(RegisterRequest request, String clientIp, String userAgent) {
@@ -124,10 +135,11 @@ public class UserService {
         return toUserResponse(user, user.getId());
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public UserResponse loginUser(LoginRequest request, String clientIp, String userAgent) {
         String identifier = request.getIdentifier();
 
+        // Single index-backed query across username, email, and phone
         Optional<User> userOpt = userRepository.findByUsername(identifier);
         if (userOpt.isEmpty()) {
             userOpt = userRepository.findByEmail(identifier);
@@ -136,19 +148,27 @@ public class UserService {
             userOpt = userRepository.findByPhone(identifier);
         }
 
-        User user = userOpt.orElseThrow(() -> new InvalidTokenException("Invalid username/email/phone or password"));
-
-        if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
-            throw new InvalidTokenException("Invalid username/email/phone or password");
+        if (userOpt.isEmpty()) {
+            throw new InvalidTokenException("Invalid username or password");
         }
 
+        User user = userOpt.get();
+
         if (!user.isActive()) {
-            throw new InvalidTokenException("Account is disabled. Please contact support or reactivate.");
+            throw new PolicyViolationException("Account is disabled or deactivated");
+        }
+
+        if (user.getPasswordHash() == null) {
+            throw new PolicyViolationException("Account does not have a local password configured (e.g. registered via Google OAuth)");
+        }
+
+        if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
+            throw new InvalidTokenException("Invalid username or password");
         }
 
         UserAuditLog auditLog = UserAuditLog.builder()
                 .userId(user.getId())
-                .activity("LOCAL_LOGIN")
+                .activity("LOGIN_SUCCESS")
                 .ipAddress(clientIp)
                 .userAgent(userAgent)
                 .details(Map.of(
@@ -161,11 +181,179 @@ public class UserService {
         return toUserResponse(user, user.getId());
     }
 
+    @Transactional
+    public ForgotPasswordResponse requestPasswordReset(ForgotPasswordRequest request, String clientIp, String userAgent) {
+        String identifier = request.getIdentifier();
+
+        Optional<User> userOpt = userRepository.findByUsername(identifier);
+        if (userOpt.isEmpty()) {
+            userOpt = userRepository.findByEmail(identifier);
+        }
+        if (userOpt.isEmpty()) {
+            userOpt = userRepository.findByPhone(identifier);
+        }
+
+        // Standard generic message for anti-enumeration: never disclose whether the account exists
+        String genericMessage = "If an active account exists with that identifier, instructions to reset your password have been sent.";
+
+        if (userOpt.isEmpty() || !userOpt.get().isActive()) {
+            log.warn("Password reset requested for non-existent or inactive identifier: {}", identifier);
+            return ForgotPasswordResponse.builder()
+                    .message(genericMessage)
+                    .build();
+        }
+
+        User user = userOpt.get();
+
+        // Rate-limiting cooldown per victim/user ID to prevent spamming / inbox-bombing
+        if (redisSessionService.isPasswordResetInCooldown(user.getId())) {
+            log.warn("Password reset for user {} ignored due to active cooldown window", user.getId());
+            return ForgotPasswordResponse.builder()
+                    .message(genericMessage)
+                    .build();
+        }
+
+        String resetToken = UUID.randomUUID().toString();
+        redisSessionService.savePasswordResetToken(resetToken, user.getId(), Duration.ofMinutes(15));
+        redisSessionService.setPasswordResetCooldown(user.getId(), Duration.ofSeconds(60));
+
+        UserAuditLog auditLog = UserAuditLog.builder()
+                .userId(user.getId())
+                .activity("PASSWORD_RESET_REQUESTED")
+                .ipAddress(clientIp)
+                .userAgent(userAgent)
+                .details(Map.of(
+                        "identifier", identifier,
+                        "timestamp", Instant.now().toString()
+                ))
+                .build();
+        auditLogRepository.save(auditLog);
+
+        // Transactional Outbox pattern: Save domain event for out-of-band delivery (mail/SMS worker)
+        PasswordResetRequestedEvent event = PasswordResetRequestedEvent.builder()
+                .eventId(UUID.randomUUID())
+                .userId(user.getId())
+                .username(user.getUsername())
+                .email(user.getEmail())
+                .resetToken(resetToken)
+                .expiresAt(Instant.now().plus(Duration.ofMinutes(15)))
+                .timestamp(Instant.now())
+                .build();
+
+        outboxService.saveEvent(
+                "USER",
+                user.getId().toString(),
+                "PASSWORD_RESET_REQUESTED",
+                passwordResetTopic,
+                event
+        );
+
+        log.info("Password reset token generated and published to outbox for user {}", user.getId());
+
+        return ForgotPasswordResponse.builder()
+                .message(genericMessage)
+                .build();
+    }
+
+    @Transactional
+    public void resetPassword(ResetPasswordRequest request, String clientIp, String userAgent) {
+        UUID userId = redisSessionService.getUserIdByPasswordResetToken(request.getResetToken());
+        if (userId == null) {
+            throw new InvalidTokenException("Invalid or expired password reset token.");
+        }
+
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + userId));
+
+        if (!user.isActive()) {
+            throw new PolicyViolationException("Cannot reset password for an inactive or disabled account.");
+        }
+
+        // Check if new password is identical to old password
+        if (user.getPasswordHash() != null && passwordEncoder.matches(request.getNewPassword(), user.getPasswordHash())) {
+            throw new PolicyViolationException("New password cannot be the same as the existing password.");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
+        userRepository.save(user);
+
+        // One-time use: consume the reset token
+        redisSessionService.deletePasswordResetToken(request.getResetToken());
+
+        // Revoke all existing sessions across all user devices
+        redisSessionService.revokeAllUserSessions(userId);
+
+        UserAuditLog auditLog = UserAuditLog.builder()
+                .userId(user.getId())
+                .activity("PASSWORD_RESET_COMPLETED")
+                .ipAddress(clientIp)
+                .userAgent(userAgent)
+                .details(Map.of("timestamp", Instant.now().toString()))
+                .build();
+        auditLogRepository.save(auditLog);
+
+        log.info("Password reset successfully completed for user {}", user.getId());
+    }
+
+    @Transactional
+    public void changePassword(UUID userId, ChangePasswordRequest request, String clientIp, String userAgent) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + userId));
+
+        if (!user.isActive()) {
+            throw new PolicyViolationException("Cannot change password for an inactive account.");
+        }
+
+        if (user.getPasswordHash() == null) {
+            throw new PolicyViolationException("Account has no existing password (e.g. Google OAuth account). Use reset password instead.");
+        }
+
+        if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPasswordHash())) {
+            throw new PolicyViolationException("Current password does not match.");
+        }
+
+        if (passwordEncoder.matches(request.getNewPassword(), user.getPasswordHash())) {
+            throw new PolicyViolationException("New password cannot be the same as the current password.");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
+        userRepository.save(user);
+
+        // Revoke all other sessions across devices
+        redisSessionService.revokeAllUserSessions(userId);
+
+        UserAuditLog auditLog = UserAuditLog.builder()
+                .userId(user.getId())
+                .activity("PASSWORD_CHANGED")
+                .ipAddress(clientIp)
+                .userAgent(userAgent)
+                .details(Map.of("timestamp", Instant.now().toString()))
+                .build();
+        auditLogRepository.save(auditLog);
+
+        log.info("Password changed successfully for user {}", user.getId());
+    }
+
     @Transactional(readOnly = true)
     public UserResponse getUserById(UUID targetUserId, UUID currentUserId) {
         User user = userRepository.findById(targetUserId)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + targetUserId));
         return toUserResponse(user, currentUserId);
+    }
+
+    @Transactional(readOnly = true)
+    public List<UserResponse> getUsersByIds(List<UUID> userIds, UUID currentUserId) {
+        if (userIds == null || userIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<UUID> distinctIds = userIds.stream().distinct().toList();
+        List<User> users = userRepository.findAllById(distinctIds);
+
+        return users.stream()
+                .filter(u -> u.isActive() || (currentUserId != null && currentUserId.equals(u.getId())))
+                .map(user -> toUserResponse(user, currentUserId))
+                .toList();
     }
 
     @Transactional(readOnly = true)
@@ -302,6 +490,8 @@ public class UserService {
                 .bio(user.getBio())
                 .pictureUrl(visiblePicture)
                 .isPrivate(user.isPrivate())
+                .isEmailPrivate(user.isEmailPrivate())
+                .isPhonePrivate(user.isPhonePrivate())
                 .isEmailVerified(user.isEmailVerified())
                 .isPhoneVerified(user.isPhoneVerified())
                 .publicProfiles(user.getPublicProfiles())

@@ -148,12 +148,12 @@ class AvatarPresignedUrlIntegrationTest {
     @Test
     void testUpdateProfile_DeletesOldAvatarFromStorage() {
         // Given existing user has an old avatar
-        String oldAvatar = "http://localhost:9000/user-avatars/avatars/" + testUser.getId() + "/old-avatar.png";
+        String oldAvatar = "http://localhost:4566/user-avatars/avatars/" + testUser.getId() + "/old-avatar.png";
         testUser.setPictureUrl(oldAvatar);
         userRepository.save(testUser);
 
         // When user updates to a new avatar
-        String newAvatar = "http://localhost:9000/user-avatars/avatars/" + testUser.getId() + "/new-avatar.png";
+        String newAvatar = "http://localhost:4566/user-avatars/avatars/" + testUser.getId() + "/new-avatar.png";
         UpdateUserRequest updateRequest = UpdateUserRequest.builder()
                 .pictureUrl(newAvatar)
                 .build();

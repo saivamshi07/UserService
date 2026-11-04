@@ -1,5 +1,6 @@
 package com.platform.userservice.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -15,7 +16,11 @@ public class UserAccessCheckResponse {
 
     private UUID authorId;
     private UUID viewerId;
+
+    @JsonProperty("isPrivate")
     private boolean isPrivate;
+
+    @JsonProperty("isFollowing")
     private boolean isFollowing;
 
     /**
